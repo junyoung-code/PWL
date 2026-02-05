@@ -138,14 +138,29 @@ class NotepadAutoSave:
         except Exception as e:
             return ""
 
+    def set_notepad_text(self, edit_hwnd, text):
+        """메모장 텍스트 설정 (내용 교체)"""
+        try:
+            win32gui.SendMessage(edit_hwnd, win32con.WM_SETTEXT, 0, text)
+            return True
+        except Exception as e:
+            self.logger.error(f"텍스트 설정 오류: {e}")
+            return False
+
     def extract_latest_barcode(self, text):
-        """텍스트에서 최신 바코드 추출 (8자리 이상 숫자)"""
+        """텍스트에서 최신 바코드 추출 (8자리 이상 숫자 또는 모든 텍스트)"""
         lines = text.strip().split('\n')
 
         for line in reversed(lines):
             line = line.strip()
-            if line and line.isdigit() and len(line) >= 8:
-                return line
+            # 8자리 이상 숫자 우선, 없으면 마지막 줄 반환
+            if line:
+                # 숫자 8자리 이상이면 바코드
+                if line.isdigit() and len(line) >= 8:
+                    return line
+                # 숫자가 아니어도 마지막 줄이면 반환
+                elif line:
+                    return line
 
         return None
 
@@ -190,25 +205,35 @@ class NotepadAutoSave:
             return False
 
     def process_notepad_content(self, hwnd, edit_hwnd):
-        """메모장 내용 처리 (바코드 추출)"""
+        """메모장 내용 처리 (바코드 추출 및 메모장 업데이트)"""
         if not self.config.get('enable_barcode_feature', True):
             return
 
         current_text = self.get_notepad_text(edit_hwnd)
 
+        # 메모장 내용이 변경되었고, 비어있지 않으면 처리
         if current_text != self.last_content and current_text.strip():
             # 최신 바코드 추출
             latest_barcode = self.extract_latest_barcode(current_text)
 
-            if latest_barcode and latest_barcode != self.last_barcode:
+            # 바코드가 추출되면 항상 처리 (같은 내용이어도!)
+            if latest_barcode:
                 self.logger.info(f"바코드 감지: {latest_barcode}")
 
-                # 자동으로 파일에 저장 (확인 없음)
+                # 1. 메모장 내용을 최신 바코드만 남기고 삭제
+                if self.set_notepad_text(edit_hwnd, latest_barcode):
+                    self.logger.info(f"메모장 내용 업데이트: {latest_barcode}만 남김")
+
+                    # 강제 저장 (내용 변경 후)
+                    time.sleep(0.1)
+                    if self.send_save_command(hwnd):
+                        self.logger.info(f"메모장 저장 완료")
+
+                # 2. 별도 파일에도 저장 (같은 내용이어도 타임스탬프 업데이트)
                 self.save_barcode_to_file(latest_barcode)
 
                 self.last_barcode = latest_barcode
-
-            self.last_content = current_text
+                self.last_content = latest_barcode  # 업데이트된 내용으로 변경
 
     def monitor_loop(self):
         """메인 모니터링 루프"""
