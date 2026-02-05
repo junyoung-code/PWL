@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Notepad Auto-Save Program
-메모장의 변화를 감지하여 자동으로 저장하는 프로그램
+Notepad Auto-Save with Barcode Support
+메모장 자동 저장 + 바코드 최신 것만 추출
 
-이 프로그램은 Windows 메모장 창을 모니터링하고,
-저장되지 않은 변경사항이 있을 때 자동으로 Ctrl+S를 전송하여 저장합니다.
+- 메모장 변경사항 자동 저장
+- 바코드 감지 및 최신 것만 파일 저장
+- 완전 자동 모드 (확인 불필요)
+- 백그라운드 처리 (방해 최소)
 """
 
 import win32gui
@@ -17,14 +19,12 @@ import logging
 from datetime import datetime
 import os
 import sys
-
-# ✅ 추가: 시작/종료 UI용
 import tkinter as tk
 from tkinter import messagebox
 
 
 class NotepadAutoSave:
-    """메모장 자동 저장 클래스"""
+    """메모장 자동 저장 + 바코드 처리 클래스"""
 
     def __init__(self, config_file='config.json'):
         """
@@ -36,39 +36,37 @@ class NotepadAutoSave:
         self.config = self.load_config(config_file)
         self.setup_logging()
 
-        # ✅ 추가: 루프를 안전하게 멈추기 위한 플래그
+        # 바코드 처리용 변수
+        self.last_content = ""
+        self.last_barcode = ""
+        self.barcode_output_file = self.config.get('barcode_output_file', 'barcode_latest.txt')
+
+        # 루프 제어
         self.stop_requested = False
 
-        self.logger.info("=" * 50)
-        self.logger.info("Notepad Auto-Save Program Started")
-        self.logger.info("=" * 50)
+        self.logger.info("=" * 60)
+        self.logger.info("Notepad Auto-Save with Barcode Support Started")
+        self.logger.info("=" * 60)
 
     def request_stop(self):
-        """✅ 추가: 외부(UI)에서 종료 요청할 때 호출"""
+        """외부(UI)에서 종료 요청할 때 호출"""
         self.stop_requested = True
-        self.logger.info("종료 요청을 받았습니다. 루프를 종료합니다...")
+        self.logger.info("종료 요청을 받았습니다. 프로그램을 종료합니다...")
 
     def load_config(self, config_file):
-        """
-        설정 파일 로드
-
-        Args:
-            config_file: 설정 파일 경로
-
-        Returns:
-            dict: 설정 사전
-        """
+        """설정 파일 로드"""
         default_config = {
             'check_interval': 5,
             'enable_logging': True,
-            'log_file': 'autosave.log'
+            'log_file': 'autosave.log',
+            'barcode_output_file': 'barcode_latest.txt',
+            'enable_barcode_feature': True
         }
 
         if os.path.exists(config_file):
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                    # 기본값과 병합
                     return {**default_config, **config}
             except Exception as e:
                 print(f"설정 파일 로드 오류: {e}")
@@ -97,19 +95,12 @@ class NotepadAutoSave:
         self.logger = logging.getLogger(__name__)
 
     def find_notepad_windows(self):
-        """
-        열려있는 모든 메모장 창 찾기
-
-        Returns:
-            list: 메모장 창 핸들 리스트
-        """
+        """열려있는 모든 메모장 창 찾기"""
         notepad_windows = []
 
         def enum_callback(hwnd, results):
-            """윈도우 열거 콜백"""
             if win32gui.IsWindowVisible(hwnd):
                 class_name = win32gui.GetClassName(hwnd)
-                # 메모장의 클래스 이름은 'Notepad'
                 if class_name == 'Notepad':
                     results.append(hwnd)
             return True
@@ -118,42 +109,62 @@ class NotepadAutoSave:
         return notepad_windows
 
     def get_window_title(self, hwnd):
-        """
-        윈도우 타이틀 가져오기
-
-        Args:
-            hwnd: 윈도우 핸들
-
-        Returns:
-            str: 윈도우 타이틀
-        """
+        """윈도우 타이틀 가져오기"""
         try:
             return win32gui.GetWindowText(hwnd)
         except Exception:
             return ""
 
     def has_unsaved_changes(self, hwnd):
-        """
-        저장되지 않은 변경사항이 있는지 확인
-        메모장은 변경사항이 있을 때 타이틀에 '*'를 표시함
-
-        Args:
-            hwnd: 윈도우 핸들
-
-        Returns:
-            bool: 저장되지 않은 변경사항 여부
-        """
+        """저장되지 않은 변경사항이 있는지 확인"""
         title = self.get_window_title(hwnd)
-        # 타이틀이 '*'로 시작하면 저장되지 않은 변경사항이 있음
         return title.startswith('*')
 
-    def send_save_command(self, hwnd):
-        """
-        Ctrl+S 키 조합을 창에 전송하여 저장
+    def get_edit_control(self, hwnd):
+        """메모장의 편집 컨트롤 찾기"""
+        return win32gui.FindWindowEx(hwnd, 0, "Edit", None)
 
-        Args:
-            hwnd: 윈도우 핸들
-        """
+    def get_notepad_text(self, edit_hwnd):
+        """메모장 텍스트 읽기"""
+        try:
+            length = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXTLENGTH, 0, 0)
+            if length == 0:
+                return ""
+
+            import ctypes
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXT, length + 1, buffer)
+            return buffer.value
+        except Exception as e:
+            return ""
+
+    def extract_latest_barcode(self, text):
+        """텍스트에서 최신 바코드 추출 (8자리 이상 숫자)"""
+        lines = text.strip().split('\n')
+
+        for line in reversed(lines):
+            line = line.strip()
+            if line and line.isdigit() and len(line) >= 8:
+                return line
+
+        return None
+
+    def save_barcode_to_file(self, barcode):
+        """바코드를 별도 파일에 저장 (최신 것만)"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        try:
+            with open(self.barcode_output_file, 'w', encoding='utf-8') as f:
+                f.write(f"최근 스캔 시간: {timestamp}\n")
+                f.write(f"바코드: {barcode}\n")
+
+            self.logger.info(f"바코드 저장 완료: {barcode} -> {self.barcode_output_file}")
+
+        except Exception as e:
+            self.logger.error(f"바코드 파일 저장 오류: {e}")
+
+    def send_save_command(self, hwnd):
+        """Ctrl+S 키 조합을 창에 전송하여 저장"""
         try:
             VK_CONTROL = win32con.VK_CONTROL
             VK_S = ord('S')
@@ -178,13 +189,39 @@ class NotepadAutoSave:
             self.logger.error(f"저장 명령 전송 오류: {e}")
             return False
 
+    def process_notepad_content(self, hwnd, edit_hwnd):
+        """메모장 내용 처리 (바코드 추출)"""
+        if not self.config.get('enable_barcode_feature', True):
+            return
+
+        current_text = self.get_notepad_text(edit_hwnd)
+
+        if current_text != self.last_content and current_text.strip():
+            # 최신 바코드 추출
+            latest_barcode = self.extract_latest_barcode(current_text)
+
+            if latest_barcode and latest_barcode != self.last_barcode:
+                self.logger.info(f"바코드 감지: {latest_barcode}")
+
+                # 자동으로 파일에 저장 (확인 없음)
+                self.save_barcode_to_file(latest_barcode)
+
+                self.last_barcode = latest_barcode
+
+            self.last_content = current_text
+
     def monitor_loop(self):
         """메인 모니터링 루프"""
         check_interval = self.config['check_interval']
+        barcode_enabled = self.config.get('enable_barcode_feature', True)
+
         self.logger.info(f"모니터링 시작 (체크 주기: {check_interval}초)")
+        if barcode_enabled:
+            self.logger.info(f"바코드 기능: 활성화 (저장 위치: {self.barcode_output_file})")
+        else:
+            self.logger.info(f"바코드 기능: 비활성화")
 
         try:
-            # ✅ 변경: while True -> stop_requested 체크
             while not self.stop_requested:
                 notepad_windows = self.find_notepad_windows()
 
@@ -194,6 +231,7 @@ class NotepadAutoSave:
                     for hwnd in notepad_windows:
                         title = self.get_window_title(hwnd)
 
+                        # 1. 자동 저장 처리
                         if self.has_unsaved_changes(hwnd):
                             self.logger.info(f"변경사항 감지: '{title}'")
 
@@ -201,6 +239,11 @@ class NotepadAutoSave:
                                 self.logger.info(f"자동 저장 완료: '{title}'")
                             else:
                                 self.logger.warning(f"자동 저장 실패: '{title}'")
+
+                        # 2. 바코드 처리
+                        edit_hwnd = self.get_edit_control(hwnd)
+                        if edit_hwnd:
+                            self.process_notepad_content(hwnd, edit_hwnd)
 
                 time.sleep(check_interval)
 
@@ -215,50 +258,60 @@ class NotepadAutoSave:
 def main():
     """메인 함수"""
 
-    # ✅ 추가: 시작 확인창
+    # 시작 확인창
     root = tk.Tk()
-    root.withdraw()  # 메인 창 숨기고 메시지박스만 사용
+    root.withdraw()
 
-    start = messagebox.askyesno("Notepad Auto-Save", "시작하겠습니까?")
+    start = messagebox.askyesno(
+        "Notepad Auto-Save",
+        "메모장 자동 저장 프로그램을 시작하시겠습니까?\n\n"
+        "기능:\n"
+        "✅ 메모장 자동 저장\n"
+        "✅ 바코드 최신 것만 추출 (자동)"
+    )
     if not start:
         return
 
-    # 프로그램 실행 (기존 흐름 유지)
+    # 프로그램 실행
     autosaver = NotepadAutoSave()
 
-    # ✅ 추가: 종료 버튼이 있는 작은 창
+    # 종료 버튼이 있는 작은 창
     ui = tk.Tk()
     ui.title("Notepad Auto-Save (실행 중)")
     ui.resizable(False, False)
 
-    label = tk.Label(ui, text="메모장 자동 저장이 실행 중입니다.\n끝내려면 아래 버튼을 누르세요.")
-    label.pack(padx=14, pady=12)
+    label = tk.Label(
+        ui,
+        text="메모장 자동 저장이 실행 중입니다.\n"
+             "바코드 기능도 활성화되었습니다.\n\n"
+             "끝내려면 아래 버튼을 누르세요.",
+        justify=tk.LEFT
+    )
+    label.pack(padx=20, pady=15)
 
     def on_exit():
         autosaver.request_stop()
         ui.destroy()
 
     exit_btn = tk.Button(ui, text="끝내기", command=on_exit, width=20)
-    exit_btn.pack(padx=14, pady=(0, 12))
+    exit_btn.pack(padx=20, pady=(0, 15))
 
     # 창 X를 눌러도 동일하게 종료
     ui.protocol("WM_DELETE_WINDOW", on_exit)
 
-    # ✅ UI 이벤트를 돌리면서, 동시에 autosave 루프도 돌려야 함
-    # 가장 최소 수정: Tkinter의 after로 루프를 "조각조각" 실행
-    # (쓰레드 추가 없이 동작)
+    # UI 이벤트 루프와 자동 저장 루프 통합
     def tick():
         if autosaver.stop_requested:
             return
 
-        # monitor_loop의 내용을 아주 조금만 분리 실행하려면 코드 변경이 커짐.
-        # 대신 "한 번의 체크 사이클"을 여기서 수행하는 방식으로 최소 구현:
         check_interval = autosaver.config['check_interval']
 
         notepad_windows = autosaver.find_notepad_windows()
         if notepad_windows:
             for hwnd in notepad_windows:
                 title = autosaver.get_window_title(hwnd)
+
+                # 자동 저장
                 if autosaver.has_unsaved_changes(hwnd):
                     autosaver.logger.info(f"변경사항 감지: '{title}'")
                     if autosaver.send_save_command(hwnd):
@@ -266,7 +319,12 @@ def main():
                     else:
                         autosaver.logger.warning(f"자동 저장 실패: '{title}'")
 
-        # 다음 실행 예약 (ms)
+                # 바코드 처리
+                edit_hwnd = autosaver.get_edit_control(hwnd)
+                if edit_hwnd:
+                    autosaver.process_notepad_content(hwnd, edit_hwnd)
+
+        # 다음 실행 예약
         ui.after(int(check_interval * 1000), tick)
 
     tick()

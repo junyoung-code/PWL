@@ -1,5 +1,7 @@
 {
   "check_interval": 5,
   "enable_logging": true,
-  "log_file": "autosave.log"
+  "log_file": "autosave.log",
+  "barcode_output_file": "barcode_latest.txt",
+  "enable_barcode_feature": true
 }
