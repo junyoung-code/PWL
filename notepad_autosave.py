@@ -165,8 +165,20 @@ class NotepadAutoSave:
                     return False
         return False
 
-    def ensure_notepad_focused(self, hwnd, max_retries=10):
-        """메모장 창에 포커스가 있는지 확인하고 설정 (다른 프로그램 보호)"""
+    def ensure_notepad_focused(self, hwnd, max_retries=10, save_original=True):
+        """메모장 창에 포커스가 있는지 확인하고 설정 (원래 창 복원 지원)"""
+        # 현재 활성화된 창 기억 (나중에 복원용)
+        original_hwnd = None
+        if save_original:
+            try:
+                original_hwnd = win32gui.GetForegroundWindow()
+                if original_hwnd == hwnd:
+                    # 이미 메모장이 활성화되어 있음
+                    self.logger.info("✓ 메모장이 이미 활성화되어 있음")
+                    return True, None
+            except:
+                pass
+
         for attempt in range(max_retries):
             try:
                 # 메모장 창을 최상위로
@@ -177,7 +189,7 @@ class NotepadAutoSave:
                 current_hwnd = win32gui.GetForegroundWindow()
                 if current_hwnd == hwnd:
                     self.logger.info(f"✓ 메모장 창 포커스 확인 완료 (시도 {attempt + 1})")
-                    return True
+                    return True, original_hwnd
                 else:
                     current_title = win32gui.GetWindowText(current_hwnd) if current_hwnd else "None"
                     self.logger.warning(f"메모장 창 포커스 실패 (시도 {attempt + 1}/{max_retries}): 현재 활성 창='{current_title}'")
@@ -187,7 +199,17 @@ class NotepadAutoSave:
             time.sleep(0.2 * (attempt + 1))  # 지수 백오프
 
         self.logger.error("✗ 메모장 창 포커스 실패! 다른 프로그램 보호를 위해 키보드 이벤트를 보내지 않습니다.")
-        return False
+        return False, None
+
+    def restore_original_window(self, original_hwnd):
+        """원래 활성화되어 있던 창으로 복원"""
+        if original_hwnd:
+            try:
+                time.sleep(0.1)  # 메모장 작업 완료 대기
+                win32gui.SetForegroundWindow(original_hwnd)
+                self.logger.info(f"✓ 원래 창으로 복원 완료")
+            except Exception as e:
+                self.logger.warning(f"원래 창 복원 실패: {e}")
 
     def get_notepad_text(self, hwnd, edit_hwnd):
         """메모장 텍스트 읽기 (클립보드 방식 - Windows 11 호환)"""
@@ -208,8 +230,9 @@ class NotepadAutoSave:
             self.logger.info(f"클립보드 방식으로 텍스트 읽기 시도...")
 
             # 메모장 창 활성화 (키보드 이벤트가 올바른 창으로 가도록)
-            # 중요: 다른 프로그램에 영향을 주지 않도록 실제 포커스 확인
-            if not self.ensure_notepad_focused(hwnd):
+            # 중요: 원래 창을 기억했다가 나중에 복원
+            success, original_hwnd = self.ensure_notepad_focused(hwnd, save_original=True)
+            if not success:
                 self.logger.error("메모장 창을 활성화할 수 없어 텍스트 읽기 실패")
                 return ""
 
@@ -276,6 +299,9 @@ class NotepadAutoSave:
                 except Exception as e:
                     self.logger.warning(f"클립보드 복원 실패: {e}")
 
+            # 원래 활성화되어 있던 창으로 복원
+            self.restore_original_window(original_hwnd)
+
             return text
 
         except Exception as e:
@@ -288,8 +314,9 @@ class NotepadAutoSave:
             self.logger.info(f"클립보드 방식으로 텍스트 설정: '{text[:50]}'")
 
             # 1. 메모장 창 활성화 (키보드 이벤트가 올바른 창으로 가도록)
-            # 중요: 다른 프로그램에 영향을 주지 않도록 실제 포커스 확인
-            if not self.ensure_notepad_focused(hwnd):
+            # 중요: 원래 창을 기억했다가 나중에 복원
+            success, original_hwnd = self.ensure_notepad_focused(hwnd, save_original=True)
+            if not success:
                 self.logger.error("메모장 창을 활성화할 수 없어 텍스트 설정 실패")
                 return False
 
@@ -340,10 +367,21 @@ class NotepadAutoSave:
             time.sleep(0.3)  # 붙여넣기 완료 대기
 
             self.logger.info(f"텍스트 설정 완료")
+
+            # 원래 활성화되어 있던 창으로 복원
+            self.restore_original_window(original_hwnd)
+
             return True
 
         except Exception as e:
             self.logger.error(f"set_notepad_text 오류: {e}", exc_info=True)
+
+            # 오류 발생 시에도 원래 창으로 복원
+            try:
+                self.restore_original_window(original_hwnd)
+            except:
+                pass
+
             return False
 
     def extract_latest_barcode(self, text):
