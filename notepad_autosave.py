@@ -132,8 +132,11 @@ class NotepadAutoSave:
             def enum_child_callback(child_hwnd, results):
                 class_name = win32gui.GetClassName(child_hwnd)
                 self.logger.info(f"  자식 윈도우 발견: {class_name}")
-                if class_name.lower() in ['edit', 'richedit', 'richedit20w', 'richedit50w']:
+                # Windows 10, 11 메모장의 다양한 편집 컨트롤 지원
+                if class_name.lower() in ['edit', 'richedit', 'richedit20w', 'richedit50w',
+                                           'richeditd2dpt', 'notepadtextbox']:
                     results.append(child_hwnd)
+                    self.logger.info(f"  → 편집 컨트롤로 인식: {class_name}")
                 return True
 
             child_windows = []
