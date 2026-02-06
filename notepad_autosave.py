@@ -165,7 +165,7 @@ class NotepadAutoSave:
                     return False
         return False
 
-    def get_notepad_text(self, edit_hwnd):
+    def get_notepad_text(self, hwnd, edit_hwnd):
         """메모장 텍스트 읽기 (클립보드 방식 - Windows 11 호환)"""
         try:
             # 방법 1: WM_GETTEXT 시도 (Windows 10 메모장용)
@@ -182,6 +182,15 @@ class NotepadAutoSave:
 
             # 방법 2: 클립보드 사용 (Windows 11 메모장용)
             self.logger.info(f"클립보드 방식으로 텍스트 읽기 시도...")
+
+            # 메모장 창 활성화 (키보드 이벤트가 올바른 창으로 가도록)
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+                win32gui.SetFocus(edit_hwnd)
+                time.sleep(0.2)  # 창 활성화 대기
+                self.logger.info("메모장 창 활성화 완료")
+            except Exception as e:
+                self.logger.warning(f"창 활성화 실패: {e}")
 
             # 현재 클립보드 백업
             old_clipboard = ""
@@ -252,15 +261,24 @@ class NotepadAutoSave:
             self.logger.error(f"get_notepad_text 오류: {e}", exc_info=True)
             return ""
 
-    def set_notepad_text(self, hwnd, text):
+    def set_notepad_text(self, hwnd, edit_hwnd, text):
         """메모장 텍스트 설정 (클립보드 방식 - Windows 11 호환)"""
         try:
             self.logger.info(f"클립보드 방식으로 텍스트 설정: '{text[:50]}'")
 
-            # 1. 클립보드가 완전히 해제될 때까지 대기
-            time.sleep(0.5)
+            # 1. 메모장 창 활성화 (키보드 이벤트가 올바른 창으로 가도록)
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+                win32gui.SetFocus(edit_hwnd)
+                time.sleep(0.3)  # 창 활성화 대기
+                self.logger.info("메모장 창 활성화 완료")
+            except Exception as e:
+                self.logger.warning(f"창 활성화 실패: {e}")
 
-            # 2. 클립보드에 텍스트 복사
+            # 2. 클립보드가 완전히 해제될 때까지 대기
+            time.sleep(0.3)
+
+            # 3. 클립보드에 텍스트 복사
             if not self.open_clipboard_with_retry():
                 self.logger.error("클립보드를 열 수 없습니다")
                 return False
@@ -279,7 +297,7 @@ class NotepadAutoSave:
                     pass
                 return False
 
-            # 3. Ctrl+A로 전체 선택
+            # 4. Ctrl+A로 전체 선택
             VK_CONTROL = win32con.VK_CONTROL
             VK_A = ord('A')
             VK_V = ord('V')
@@ -293,7 +311,7 @@ class NotepadAutoSave:
             win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
             time.sleep(0.15)
 
-            # 4. Ctrl+V로 붙여넣기
+            # 5. Ctrl+V로 붙여넣기
             win32api.keybd_event(VK_CONTROL, 0, 0, 0)
             time.sleep(0.05)
             win32api.keybd_event(VK_V, 0, 0, 0)
@@ -360,50 +378,67 @@ class NotepadAutoSave:
     def process_notepad_content(self, hwnd, edit_hwnd):
         """메모장 내용 처리 (바코드 추출 및 메모장 업데이트)"""
         if not self.config.get('enable_barcode_feature', True):
+            self.logger.info("바코드 기능이 비활성화되어 있습니다.")
             return
 
         if not edit_hwnd:
             self.logger.error("Edit 컨트롤이 없습니다!")
             return
 
-        current_text = self.get_notepad_text(edit_hwnd)
-        self.logger.debug(f"현재 메모장 내용 (길이: {len(current_text)}): {current_text[:100]}")
+        current_text = self.get_notepad_text(hwnd, edit_hwnd)
+        self.logger.info(f"[디버그] 현재 메모장 내용 (길이: {len(current_text)}): '{current_text[:100]}'")
+        self.logger.info(f"[디버그] 이전 내용 (길이: {len(self.last_content)}): '{self.last_content[:100] if self.last_content else 'None'}'")
 
-        # 메모장 내용이 변경되었고, 비어있지 않으면 처리
-        if current_text != self.last_content and current_text.strip():
-            # 최신 바코드 추출
-            latest_barcode = self.extract_latest_barcode(current_text)
+        # 메모장 내용이 비어있으면 스킵
+        if not current_text.strip():
+            self.logger.info("[디버그] 메모장이 비어있습니다. 처리 건너뜀")
+            return
 
-            # 바코드가 추출되면 항상 처리 (같은 내용이어도!)
-            if latest_barcode:
-                self.logger.info(f"바코드 감지: {latest_barcode}")
+        # 메모장 내용이 변경되었는지 확인
+        if current_text == self.last_content:
+            self.logger.info("[디버그] 내용이 이전과 동일합니다. 처리 건너뜀")
+            return
 
-                # 무한 루프 방지: 이미 한 줄만 있고 그게 최신 바코드면 스킵
-                if current_text.strip() == latest_barcode.strip():
-                    self.logger.debug(f"이미 마지막 줄만 남아있습니다. 스킵합니다.")
-                    self.last_content = current_text
-                    self.last_barcode = latest_barcode
-                    return
+        self.logger.info("[디버그] 내용이 변경되었습니다! 바코드 추출 시작")
 
-                # 1. 메모장 내용을 최신 바코드만 남기고 삭제
-                if self.set_notepad_text(hwnd, latest_barcode):
-                    self.logger.info(f"메모장 내용 업데이트: {latest_barcode}만 남김")
+        # 최신 바코드 추출
+        latest_barcode = self.extract_latest_barcode(current_text)
+        self.logger.info(f"[디버그] 추출된 바코드: '{latest_barcode}'")
 
-                    # 강제 저장 (내용 변경 후)
-                    time.sleep(0.1)
-                    if self.send_save_command(hwnd):
-                        self.logger.info(f"메모장 저장 완료")
+        # 바코드가 추출되면 항상 처리 (같은 내용이어도!)
+        if latest_barcode:
+            self.logger.info(f"✓ 바코드 감지: '{latest_barcode}'")
 
-                    # 2. 별도 파일에도 저장 (같은 내용이어도 타임스탬프 업데이트)
-                    self.save_barcode_to_file(latest_barcode)
+            # 무한 루프 방지: 이미 한 줄만 있고 그게 최신 바코드면 스킵
+            if current_text.strip() == latest_barcode.strip():
+                self.logger.info(f"[디버그] 이미 마지막 줄만 남아있습니다. 스킵합니다.")
+                self.last_content = current_text
+                self.last_barcode = latest_barcode
+                return
 
-                    self.last_barcode = latest_barcode
-                    self.last_content = latest_barcode  # 업데이트된 내용으로 변경
-                else:
-                    # 텍스트 설정 실패 시 무한 루프 방지
-                    self.logger.error(f"텍스트 설정 실패! 무한 루프 방지를 위해 last_content 업데이트")
-                    self.last_content = current_text
-                    self.last_barcode = latest_barcode
+            self.logger.info(f"[디버그] 여러 줄 감지됨. 마지막 줄만 남기기 시작...")
+
+            # 1. 메모장 내용을 최신 바코드만 남기고 삭제
+            if self.set_notepad_text(hwnd, edit_hwnd, latest_barcode):
+                self.logger.info(f"✓ 메모장 내용 업데이트 성공: '{latest_barcode}'만 남김")
+
+                # 강제 저장 (내용 변경 후)
+                time.sleep(0.1)
+                if self.send_save_command(hwnd):
+                    self.logger.info(f"✓ 메모장 저장 완료")
+
+                # 2. 별도 파일에도 저장 (같은 내용이어도 타임스탬프 업데이트)
+                self.save_barcode_to_file(latest_barcode)
+
+                self.last_barcode = latest_barcode
+                self.last_content = latest_barcode  # 업데이트된 내용으로 변경
+            else:
+                # 텍스트 설정 실패 시 무한 루프 방지
+                self.logger.error(f"✗ 텍스트 설정 실패! 무한 루프 방지를 위해 last_content 업데이트")
+                self.last_content = current_text
+                self.last_barcode = latest_barcode
+        else:
+            self.logger.warning(f"[디버그] 바코드를 추출할 수 없습니다.")
 
     def monitor_loop(self):
         """메인 모니터링 루프"""
