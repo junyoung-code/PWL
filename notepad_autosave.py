@@ -231,54 +231,52 @@ class NotepadAutoSave:
             return ""
 
     def set_notepad_text(self, hwnd, edit_hwnd, text):
-        """메모장 텍스트 설정 (여러 방법 시도)"""
-        import ctypes
-
-        # 방법 1: EM_REPLACESEL (가장 확실)
+        """메모장 텍스트 설정 (클립보드 방식 - Windows 11 호환)"""
         try:
-            self.logger.info(f"방법 1 시도: EM_REPLACESEL")
-            EM_SETSEL = 0x00B1
-            EM_REPLACESEL = 0x00C2
+            self.logger.info(f"클립보드 방식으로 텍스트 설정: '{text[:50]}'")
 
-            # 전체 선택
-            win32gui.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)
+            # 1. 클립보드에 텍스트 복사
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
+            win32clipboard.CloseClipboard()
 
-            # 텍스트 교체
-            text_buffer = ctypes.create_unicode_buffer(text)
-            result = ctypes.windll.user32.SendMessageW(
-                edit_hwnd, EM_REPLACESEL, 1, ctypes.byref(text_buffer)
-            )
+            # 2. Ctrl+A로 전체 선택
+            VK_CONTROL = win32con.VK_CONTROL
+            VK_A = ord('A')
+            VK_V = ord('V')
 
-            # 검증: 실제로 변경되었는지 확인
+            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_A, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_A, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
             time.sleep(0.1)
+
+            # 3. Ctrl+V로 붙여넣기
+            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_V, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_V, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.2)
+
+            # 4. 검증: 실제로 변경되었는지 확인
             new_text = self.get_notepad_text(edit_hwnd)
             if new_text.strip() == text.strip():
-                self.logger.info(f"방법 1 성공!")
+                self.logger.info(f"클립보드 방식 성공!")
                 return True
             else:
-                self.logger.warning(f"방법 1 실패: 텍스트가 변경되지 않음")
+                self.logger.error(f"클립보드 방식 실패: 예상='{text}', 실제='{new_text}'")
+                return False
+
         except Exception as e:
-            self.logger.error(f"방법 1 오류: {e}")
-
-        # 방법 2: WM_SETTEXT (간단하지만 일부 환경에서 차단됨)
-        try:
-            self.logger.info(f"방법 2 시도: WM_SETTEXT")
-            win32gui.SendMessage(edit_hwnd, win32con.WM_SETTEXT, 0, text)
-
-            # 검증
-            time.sleep(0.1)
-            new_text = self.get_notepad_text(edit_hwnd)
-            if new_text.strip() == text.strip():
-                self.logger.info(f"방법 2 성공!")
-                return True
-            else:
-                self.logger.warning(f"방법 2 실패")
-        except Exception as e:
-            self.logger.error(f"방법 2 오류: {e}")
-
-        # 모든 방법 실패
-        self.logger.error(f"모든 텍스트 설정 방법 실패!")
-        return False
+            self.logger.error(f"set_notepad_text 오류: {e}", exc_info=True)
+            return False
 
     def extract_latest_barcode(self, text):
         """텍스트에서 최신 바코드 추출 (8자리 이상 숫자 또는 모든 텍스트)"""
