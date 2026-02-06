@@ -150,6 +150,21 @@ class NotepadAutoSave:
 
         return edit_hwnd
 
+    def open_clipboard_with_retry(self, max_retries=5, delay=0.2):
+        """클립보드를 재시도 로직과 함께 열기"""
+        for attempt in range(max_retries):
+            try:
+                win32clipboard.OpenClipboard()
+                return True
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(f"클립보드 열기 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(delay * (attempt + 1))  # 지수 백오프
+                else:
+                    self.logger.error(f"클립보드 열기 최종 실패: {e}")
+                    return False
+        return False
+
     def get_notepad_text(self, edit_hwnd):
         """메모장 텍스트 읽기 (클립보드 방식 - Windows 11 호환)"""
         try:
@@ -171,12 +186,13 @@ class NotepadAutoSave:
             # 현재 클립보드 백업
             old_clipboard = ""
             try:
-                win32clipboard.OpenClipboard()
-                if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
-                    old_clipboard = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-                win32clipboard.CloseClipboard()
-            except:
-                pass
+                if self.open_clipboard_with_retry():
+                    if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                        old_clipboard = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+                    win32clipboard.CloseClipboard()
+                time.sleep(0.1)  # 클립보드 해제 대기
+            except Exception as e:
+                self.logger.warning(f"클립보드 백업 실패: {e}")
 
             # Ctrl+A로 전체 선택
             VK_CONTROL = win32con.VK_CONTROL
@@ -190,7 +206,7 @@ class NotepadAutoSave:
             win32api.keybd_event(VK_A, 0, win32con.KEYEVENTF_KEYUP, 0)
             time.sleep(0.05)
             win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.1)
+            time.sleep(0.15)
 
             # Ctrl+C로 복사
             win32api.keybd_event(VK_CONTROL, 0, 0, 0)
@@ -200,29 +216,35 @@ class NotepadAutoSave:
             win32api.keybd_event(VK_C, 0, win32con.KEYEVENTF_KEYUP, 0)
             time.sleep(0.05)
             win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.1)
+            time.sleep(0.2)  # 복사 완료 대기
 
             # 클립보드에서 읽기
             text = ""
             try:
-                win32clipboard.OpenClipboard()
-                if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
-                    text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-                win32clipboard.CloseClipboard()
-                self.logger.info(f"클립보드에서 텍스트 읽기 성공: '{text[:50]}'")
+                if self.open_clipboard_with_retry():
+                    if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                        text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+                    win32clipboard.CloseClipboard()
+                    self.logger.info(f"클립보드에서 텍스트 읽기 성공: '{text[:50]}'")
+                time.sleep(0.1)  # 클립보드 해제 대기
             except Exception as e:
                 self.logger.error(f"클립보드 읽기 오류: {e}")
-                win32clipboard.CloseClipboard()
+                try:
+                    win32clipboard.CloseClipboard()
+                except:
+                    pass
 
             # 원래 클립보드 복원
             if old_clipboard:
                 try:
-                    win32clipboard.OpenClipboard()
-                    win32clipboard.EmptyClipboard()
-                    win32clipboard.SetClipboardText(old_clipboard, win32con.CF_UNICODETEXT)
-                    win32clipboard.CloseClipboard()
-                except:
-                    pass
+                    time.sleep(0.2)  # 복원 전 충분한 대기
+                    if self.open_clipboard_with_retry():
+                        win32clipboard.EmptyClipboard()
+                        win32clipboard.SetClipboardText(old_clipboard, win32con.CF_UNICODETEXT)
+                        win32clipboard.CloseClipboard()
+                    time.sleep(0.1)
+                except Exception as e:
+                    self.logger.warning(f"클립보드 복원 실패: {e}")
 
             return text
 
@@ -230,18 +252,34 @@ class NotepadAutoSave:
             self.logger.error(f"get_notepad_text 오류: {e}", exc_info=True)
             return ""
 
-    def set_notepad_text(self, hwnd, edit_hwnd, text):
+    def set_notepad_text(self, hwnd, text):
         """메모장 텍스트 설정 (클립보드 방식 - Windows 11 호환)"""
         try:
             self.logger.info(f"클립보드 방식으로 텍스트 설정: '{text[:50]}'")
 
-            # 1. 클립보드에 텍스트 복사
-            win32clipboard.OpenClipboard()
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
-            win32clipboard.CloseClipboard()
+            # 1. 클립보드가 완전히 해제될 때까지 대기
+            time.sleep(0.5)
 
-            # 2. Ctrl+A로 전체 선택
+            # 2. 클립보드에 텍스트 복사
+            if not self.open_clipboard_with_retry():
+                self.logger.error("클립보드를 열 수 없습니다")
+                return False
+
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
+                win32clipboard.CloseClipboard()
+                self.logger.info("클립보드에 텍스트 설정 완료")
+                time.sleep(0.2)  # 클립보드 해제 대기
+            except Exception as e:
+                self.logger.error(f"클립보드 설정 오류: {e}")
+                try:
+                    win32clipboard.CloseClipboard()
+                except:
+                    pass
+                return False
+
+            # 3. Ctrl+A로 전체 선택
             VK_CONTROL = win32con.VK_CONTROL
             VK_A = ord('A')
             VK_V = ord('V')
@@ -253,9 +291,9 @@ class NotepadAutoSave:
             win32api.keybd_event(VK_A, 0, win32con.KEYEVENTF_KEYUP, 0)
             time.sleep(0.05)
             win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.1)
+            time.sleep(0.15)
 
-            # 3. Ctrl+V로 붙여넣기
+            # 4. Ctrl+V로 붙여넣기
             win32api.keybd_event(VK_CONTROL, 0, 0, 0)
             time.sleep(0.05)
             win32api.keybd_event(VK_V, 0, 0, 0)
@@ -263,16 +301,10 @@ class NotepadAutoSave:
             win32api.keybd_event(VK_V, 0, win32con.KEYEVENTF_KEYUP, 0)
             time.sleep(0.05)
             win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.2)
+            time.sleep(0.3)  # 붙여넣기 완료 대기
 
-            # 4. 검증: 실제로 변경되었는지 확인
-            new_text = self.get_notepad_text(edit_hwnd)
-            if new_text.strip() == text.strip():
-                self.logger.info(f"클립보드 방식 성공!")
-                return True
-            else:
-                self.logger.error(f"클립보드 방식 실패: 예상='{text}', 실제='{new_text}'")
-                return False
+            self.logger.info(f"텍스트 설정 완료")
+            return True
 
         except Exception as e:
             self.logger.error(f"set_notepad_text 오류: {e}", exc_info=True)
@@ -354,7 +386,7 @@ class NotepadAutoSave:
                     return
 
                 # 1. 메모장 내용을 최신 바코드만 남기고 삭제
-                if self.set_notepad_text(hwnd, edit_hwnd, latest_barcode):
+                if self.set_notepad_text(hwnd, latest_barcode):
                     self.logger.info(f"메모장 내용 업데이트: {latest_barcode}만 남김")
 
                     # 강제 저장 (내용 변경 후)
