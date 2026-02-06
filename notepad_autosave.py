@@ -154,14 +154,20 @@ class NotepadAutoSave:
         """메모장 텍스트 읽기"""
         try:
             length = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXTLENGTH, 0, 0)
+            self.logger.debug(f"텍스트 길이: {length}")
+
             if length == 0:
+                self.logger.warning(f"WM_GETTEXTLENGTH가 0을 반환했습니다. 텍스트가 없거나 읽을 수 없습니다.")
                 return ""
 
             import ctypes
             buffer = ctypes.create_unicode_buffer(length + 1)
-            win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXT, length + 1, buffer)
-            return buffer.value
+            result = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXT, length + 1, buffer)
+            text = buffer.value
+            self.logger.debug(f"WM_GETTEXT 결과 길이: {result}, 실제 텍스트: '{text[:50]}'")
+            return text
         except Exception as e:
+            self.logger.error(f"get_notepad_text 오류: {e}", exc_info=True)
             return ""
 
     def set_notepad_text(self, hwnd, edit_hwnd, text):
