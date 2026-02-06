@@ -165,6 +165,30 @@ class NotepadAutoSave:
                     return False
         return False
 
+    def ensure_notepad_focused(self, hwnd, max_retries=10):
+        """메모장 창에 포커스가 있는지 확인하고 설정 (다른 프로그램 보호)"""
+        for attempt in range(max_retries):
+            try:
+                # 메모장 창을 최상위로
+                win32gui.SetForegroundWindow(hwnd)
+                time.sleep(0.15)
+
+                # 현재 포커스된 창이 메모장인지 확인
+                current_hwnd = win32gui.GetForegroundWindow()
+                if current_hwnd == hwnd:
+                    self.logger.info(f"✓ 메모장 창 포커스 확인 완료 (시도 {attempt + 1})")
+                    return True
+                else:
+                    current_title = win32gui.GetWindowText(current_hwnd) if current_hwnd else "None"
+                    self.logger.warning(f"메모장 창 포커스 실패 (시도 {attempt + 1}/{max_retries}): 현재 활성 창='{current_title}'")
+            except Exception as e:
+                self.logger.warning(f"창 활성화 오류 (시도 {attempt + 1}): {e}")
+
+            time.sleep(0.2 * (attempt + 1))  # 지수 백오프
+
+        self.logger.error("✗ 메모장 창 포커스 실패! 다른 프로그램 보호를 위해 키보드 이벤트를 보내지 않습니다.")
+        return False
+
     def get_notepad_text(self, hwnd, edit_hwnd):
         """메모장 텍스트 읽기 (클립보드 방식 - Windows 11 호환)"""
         try:
@@ -184,13 +208,10 @@ class NotepadAutoSave:
             self.logger.info(f"클립보드 방식으로 텍스트 읽기 시도...")
 
             # 메모장 창 활성화 (키보드 이벤트가 올바른 창으로 가도록)
-            try:
-                win32gui.SetForegroundWindow(hwnd)
-                win32gui.SetFocus(edit_hwnd)
-                time.sleep(0.2)  # 창 활성화 대기
-                self.logger.info("메모장 창 활성화 완료")
-            except Exception as e:
-                self.logger.warning(f"창 활성화 실패: {e}")
+            # 중요: 다른 프로그램에 영향을 주지 않도록 실제 포커스 확인
+            if not self.ensure_notepad_focused(hwnd):
+                self.logger.error("메모장 창을 활성화할 수 없어 텍스트 읽기 실패")
+                return ""
 
             # 현재 클립보드 백업
             old_clipboard = ""
@@ -267,13 +288,10 @@ class NotepadAutoSave:
             self.logger.info(f"클립보드 방식으로 텍스트 설정: '{text[:50]}'")
 
             # 1. 메모장 창 활성화 (키보드 이벤트가 올바른 창으로 가도록)
-            try:
-                win32gui.SetForegroundWindow(hwnd)
-                win32gui.SetFocus(edit_hwnd)
-                time.sleep(0.3)  # 창 활성화 대기
-                self.logger.info("메모장 창 활성화 완료")
-            except Exception as e:
-                self.logger.warning(f"창 활성화 실패: {e}")
+            # 중요: 다른 프로그램에 영향을 주지 않도록 실제 포커스 확인
+            if not self.ensure_notepad_focused(hwnd):
+                self.logger.error("메모장 창을 활성화할 수 없어 텍스트 설정 실패")
+                return False
 
             # 2. 클립보드가 완전히 해제될 때까지 대기
             time.sleep(0.3)
