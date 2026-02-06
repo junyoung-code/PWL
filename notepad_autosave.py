@@ -211,6 +211,33 @@ class NotepadAutoSave:
             except Exception as e:
                 self.logger.warning(f"원래 창 복원 실패: {e}")
 
+    def hide_window_temporarily(self, hwnd):
+        """메모장 창을 화면 밖으로 이동 (작업 시각적으로 숨김)"""
+        try:
+            # 원래 위치와 크기 저장
+            rect = win32gui.GetWindowRect(hwnd)
+            original_pos = (rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1])
+
+            # 화면 밖으로 이동 (-10000, -10000)
+            win32gui.MoveWindow(hwnd, -10000, -10000, original_pos[2], original_pos[3], True)
+            time.sleep(0.05)  # 이동 완료 대기
+
+            self.logger.info("✓ 메모장 창 임시 숨김 (화면 밖으로 이동)")
+            return original_pos
+        except Exception as e:
+            self.logger.warning(f"창 숨김 실패: {e}")
+            return None
+
+    def restore_window_position(self, hwnd, original_pos):
+        """메모장 창을 원래 위치로 복원"""
+        if original_pos:
+            try:
+                win32gui.MoveWindow(hwnd, original_pos[0], original_pos[1], original_pos[2], original_pos[3], True)
+                time.sleep(0.05)  # 이동 완료 대기
+                self.logger.info("✓ 메모장 창 원래 위치로 복원")
+            except Exception as e:
+                self.logger.warning(f"창 위치 복원 실패: {e}")
+
     def get_notepad_text(self, hwnd, edit_hwnd):
         """메모장 텍스트 읽기 (클립보드 방식 - Windows 11 호환)"""
         try:
@@ -235,6 +262,9 @@ class NotepadAutoSave:
             if not success:
                 self.logger.error("메모장 창을 활성화할 수 없어 텍스트 읽기 실패")
                 return ""
+
+            # 메모장을 화면 밖으로 이동 (사용자에게 보이지 않도록)
+            window_pos = self.hide_window_temporarily(hwnd)
 
             # 현재 클립보드 백업
             old_clipboard = ""
@@ -299,6 +329,9 @@ class NotepadAutoSave:
                 except Exception as e:
                     self.logger.warning(f"클립보드 복원 실패: {e}")
 
+            # 메모장 창을 원래 위치로 복원
+            self.restore_window_position(hwnd, window_pos)
+
             # 원래 활성화되어 있던 창으로 복원
             self.restore_original_window(original_hwnd)
 
@@ -319,6 +352,9 @@ class NotepadAutoSave:
             if not success:
                 self.logger.error("메모장 창을 활성화할 수 없어 텍스트 설정 실패")
                 return False
+
+            # 메모장을 화면 밖으로 이동 (사용자에게 보이지 않도록)
+            window_pos = self.hide_window_temporarily(hwnd)
 
             # 2. 클립보드가 완전히 해제될 때까지 대기
             time.sleep(0.3)
@@ -368,6 +404,9 @@ class NotepadAutoSave:
 
             self.logger.info(f"텍스트 설정 완료")
 
+            # 메모장 창을 원래 위치로 복원
+            self.restore_window_position(hwnd, window_pos)
+
             # 원래 활성화되어 있던 창으로 복원
             self.restore_original_window(original_hwnd)
 
@@ -376,8 +415,9 @@ class NotepadAutoSave:
         except Exception as e:
             self.logger.error(f"set_notepad_text 오류: {e}", exc_info=True)
 
-            # 오류 발생 시에도 원래 창으로 복원
+            # 오류 발생 시에도 원래 위치/창으로 복원
             try:
+                self.restore_window_position(hwnd, window_pos)
                 self.restore_original_window(original_hwnd)
             except:
                 pass
