@@ -140,22 +140,54 @@ class NotepadAutoSave:
             return ""
 
     def set_notepad_text(self, hwnd, edit_hwnd, text):
-        """메모장 텍스트 설정 (Edit 컨트롤 직접 제어 - 가장 안정적)"""
+        """메모장 텍스트 설정 (여러 방법 시도)"""
+        import ctypes
+
+        # 방법 1: EM_REPLACESEL (가장 확실)
         try:
-            # EM_SETSEL: 전체 텍스트 선택 (0, -1)
+            self.logger.info(f"방법 1 시도: EM_REPLACESEL")
             EM_SETSEL = 0x00B1
             EM_REPLACESEL = 0x00C2
 
-            # 1. 전체 텍스트 선택
+            # 전체 선택
             win32gui.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)
 
-            # 2. 선택된 텍스트를 새 텍스트로 교체
-            win32gui.SendMessage(edit_hwnd, EM_REPLACESEL, True, text)
+            # 텍스트 교체
+            text_buffer = ctypes.create_unicode_buffer(text)
+            result = ctypes.windll.user32.SendMessageW(
+                edit_hwnd, EM_REPLACESEL, 1, ctypes.byref(text_buffer)
+            )
 
-            return True
+            # 검증: 실제로 변경되었는지 확인
+            time.sleep(0.1)
+            new_text = self.get_notepad_text(edit_hwnd)
+            if new_text.strip() == text.strip():
+                self.logger.info(f"방법 1 성공!")
+                return True
+            else:
+                self.logger.warning(f"방법 1 실패: 텍스트가 변경되지 않음")
         except Exception as e:
-            self.logger.error(f"텍스트 설정 오류: {e}")
-            return False
+            self.logger.error(f"방법 1 오류: {e}")
+
+        # 방법 2: WM_SETTEXT (간단하지만 일부 환경에서 차단됨)
+        try:
+            self.logger.info(f"방법 2 시도: WM_SETTEXT")
+            win32gui.SendMessage(edit_hwnd, win32con.WM_SETTEXT, 0, text)
+
+            # 검증
+            time.sleep(0.1)
+            new_text = self.get_notepad_text(edit_hwnd)
+            if new_text.strip() == text.strip():
+                self.logger.info(f"방법 2 성공!")
+                return True
+            else:
+                self.logger.warning(f"방법 2 실패")
+        except Exception as e:
+            self.logger.error(f"방법 2 오류: {e}")
+
+        # 모든 방법 실패
+        self.logger.error(f"모든 텍스트 설정 방법 실패!")
+        return False
 
     def extract_latest_barcode(self, text):
         """텍스트에서 최신 바코드 추출 (8자리 이상 숫자 또는 모든 텍스트)"""
