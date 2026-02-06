@@ -140,44 +140,21 @@ class NotepadAutoSave:
             return ""
 
     def set_notepad_text(self, hwnd, edit_hwnd, text):
-        """메모장 텍스트 설정 (클립보드 방식 - 더 안정적)"""
+        """메모장 텍스트 설정 (Edit 컨트롤 직접 제어 - 가장 안정적)"""
         try:
-            # 1. 클립보드에 텍스트 복사
-            win32clipboard.OpenClipboard()
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-            win32clipboard.CloseClipboard()
+            # EM_SETSEL: 전체 텍스트 선택 (0, -1)
+            EM_SETSEL = 0x00B1
+            EM_REPLACESEL = 0x00C2
 
-            # 2. 메모장 창 활성화
-            win32gui.SetForegroundWindow(hwnd)
-            time.sleep(0.1)
+            # 1. 전체 텍스트 선택
+            win32gui.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)
 
-            # 3. Ctrl+A (전체 선택)
-            VK_CONTROL = win32con.VK_CONTROL
-            VK_A = ord('A')
-            VK_V = ord('V')
-
-            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_A, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_A, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.1)
-
-            # 4. Ctrl+V (붙여넣기)
-            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_V, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_V, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            # 2. 선택된 텍스트를 새 텍스트로 교체
+            win32gui.SendMessage(edit_hwnd, EM_REPLACESEL, True, text)
 
             return True
         except Exception as e:
-            self.logger.error(f"텍스트 설정 오류 (클립보드): {e}")
+            self.logger.error(f"텍스트 설정 오류: {e}")
             return False
 
     def extract_latest_barcode(self, text):
