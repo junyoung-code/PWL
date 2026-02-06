@@ -13,6 +13,7 @@ Notepad Auto-Save with Barcode Support
 import win32gui
 import win32con
 import win32api
+import win32clipboard
 import time
 import json
 import logging
@@ -138,13 +139,45 @@ class NotepadAutoSave:
         except Exception as e:
             return ""
 
-    def set_notepad_text(self, edit_hwnd, text):
-        """메모장 텍스트 설정 (내용 교체)"""
+    def set_notepad_text(self, hwnd, edit_hwnd, text):
+        """메모장 텍스트 설정 (클립보드 방식 - 더 안정적)"""
         try:
-            win32gui.SendMessage(edit_hwnd, win32con.WM_SETTEXT, 0, text)
+            # 1. 클립보드에 텍스트 복사
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+            win32clipboard.CloseClipboard()
+
+            # 2. 메모장 창 활성화
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(0.1)
+
+            # 3. Ctrl+A (전체 선택)
+            VK_CONTROL = win32con.VK_CONTROL
+            VK_A = ord('A')
+            VK_V = ord('V')
+
+            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_A, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_A, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.1)
+
+            # 4. Ctrl+V (붙여넣기)
+            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_V, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_V, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+
             return True
         except Exception as e:
-            self.logger.error(f"텍스트 설정 오류: {e}")
+            self.logger.error(f"텍스트 설정 오류 (클립보드): {e}")
             return False
 
     def extract_latest_barcode(self, text):
@@ -220,8 +253,8 @@ class NotepadAutoSave:
             if latest_barcode:
                 self.logger.info(f"바코드 감지: {latest_barcode}")
 
-                # 1. 메모장 내용을 최신 바코드만 남기고 삭제
-                if self.set_notepad_text(edit_hwnd, latest_barcode):
+                # 1. 메모장 내용을 최신 바코드만 남기고 삭제 (클립보드 방식)
+                if self.set_notepad_text(hwnd, edit_hwnd, latest_barcode):
                     self.logger.info(f"메모장 내용 업데이트: {latest_barcode}만 남김")
 
                     # 강제 저장 (내용 변경 후)
@@ -302,7 +335,7 @@ def main():
 
     # 종료 버튼이 있는 작은 창
     ui = tk.Tk()
-    ui.title("Notepad Auto-Save (실행 중)")
+    ui.title("Noㅇtepad Auto-Save (실행 중)")
     ui.resizable(False, False)
 
     label = tk.Label(
