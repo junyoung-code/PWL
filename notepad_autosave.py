@@ -189,25 +189,15 @@ class NotepadAutoSave:
             self.logger.error(f"바코드 파일 저장 오류: {e}")
 
     def send_save_command(self, hwnd):
-        """Ctrl+S 키 조합을 창에 전송하여 저장"""
+        """메모장 창에 직접 저장 명령 전송 (다른 프로그램에 영향 없음)"""
         try:
-            VK_CONTROL = win32con.VK_CONTROL
-            VK_S = ord('S')
+            # WM_COMMAND with IDFILE_SAVE (메모장의 저장 명령)
+            # 메뉴 ID: File > Save = 3 (0x0003)
+            WM_COMMAND = 0x0111
+            IDFILE_SAVE = 3
 
-            # Ctrl 키 누름
-            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.05)
-
-            # S 키 누름
-            win32api.keybd_event(VK_S, 0, 0, 0)
-            time.sleep(0.05)
-
-            # S 키 뗌
-            win32api.keybd_event(VK_S, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.05)
-
-            # Ctrl 키 뗌
-            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            # 메모장 창에만 저장 명령 전송 (다른 프로그램에 영향 없음)
+            win32gui.SendMessage(hwnd, WM_COMMAND, IDFILE_SAVE, 0)
 
             return True
         except Exception as e:
