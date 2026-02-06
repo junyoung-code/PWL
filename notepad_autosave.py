@@ -151,21 +151,81 @@ class NotepadAutoSave:
         return edit_hwnd
 
     def get_notepad_text(self, edit_hwnd):
-        """메모장 텍스트 읽기"""
+        """메모장 텍스트 읽기 (클립보드 방식 - Windows 11 호환)"""
         try:
+            # 방법 1: WM_GETTEXT 시도 (Windows 10 메모장용)
             length = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXTLENGTH, 0, 0)
-            self.logger.debug(f"텍스트 길이: {length}")
 
-            if length == 0:
-                self.logger.warning(f"WM_GETTEXTLENGTH가 0을 반환했습니다. 텍스트가 없거나 읽을 수 없습니다.")
-                return ""
+            if length > 0:
+                import ctypes
+                buffer = ctypes.create_unicode_buffer(length + 1)
+                result = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXT, length + 1, buffer)
+                if result > 0:
+                    text = buffer.value
+                    self.logger.debug(f"WM_GETTEXT 성공: '{text[:50]}'")
+                    return text
 
-            import ctypes
-            buffer = ctypes.create_unicode_buffer(length + 1)
-            result = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXT, length + 1, buffer)
-            text = buffer.value
-            self.logger.debug(f"WM_GETTEXT 결과 길이: {result}, 실제 텍스트: '{text[:50]}'")
+            # 방법 2: 클립보드 사용 (Windows 11 메모장용)
+            self.logger.info(f"클립보드 방식으로 텍스트 읽기 시도...")
+
+            # 현재 클립보드 백업
+            old_clipboard = ""
+            try:
+                win32clipboard.OpenClipboard()
+                if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                    old_clipboard = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+                win32clipboard.CloseClipboard()
+            except:
+                pass
+
+            # Ctrl+A로 전체 선택
+            VK_CONTROL = win32con.VK_CONTROL
+            VK_A = ord('A')
+            VK_C = ord('C')
+
+            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_A, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_A, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.1)
+
+            # Ctrl+C로 복사
+            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_C, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_C, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.1)
+
+            # 클립보드에서 읽기
+            text = ""
+            try:
+                win32clipboard.OpenClipboard()
+                if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                    text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+                win32clipboard.CloseClipboard()
+                self.logger.info(f"클립보드에서 텍스트 읽기 성공: '{text[:50]}'")
+            except Exception as e:
+                self.logger.error(f"클립보드 읽기 오류: {e}")
+                win32clipboard.CloseClipboard()
+
+            # 원래 클립보드 복원
+            if old_clipboard:
+                try:
+                    win32clipboard.OpenClipboard()
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardText(old_clipboard, win32con.CF_UNICODETEXT)
+                    win32clipboard.CloseClipboard()
+                except:
+                    pass
+
             return text
+
         except Exception as e:
             self.logger.error(f"get_notepad_text 오류: {e}", exc_info=True)
             return ""
