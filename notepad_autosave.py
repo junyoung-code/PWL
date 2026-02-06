@@ -123,7 +123,29 @@ class NotepadAutoSave:
 
     def get_edit_control(self, hwnd):
         """메모장의 편집 컨트롤 찾기"""
-        return win32gui.FindWindowEx(hwnd, 0, "Edit", None)
+        edit_hwnd = win32gui.FindWindowEx(hwnd, 0, "Edit", None)
+
+        if not edit_hwnd:
+            # Edit 컨트롤을 찾지 못하면 모든 자식 윈도우 검색
+            self.logger.warning(f"Edit 컨트롤을 직접 찾지 못함. 자식 윈도우 검색 중...")
+
+            def enum_child_callback(child_hwnd, results):
+                class_name = win32gui.GetClassName(child_hwnd)
+                self.logger.info(f"  자식 윈도우 발견: {class_name}")
+                if class_name.lower() in ['edit', 'richedit', 'richedit20w', 'richedit50w']:
+                    results.append(child_hwnd)
+                return True
+
+            child_windows = []
+            win32gui.EnumChildWindows(hwnd, enum_child_callback, child_windows)
+
+            if child_windows:
+                edit_hwnd = child_windows[0]
+                self.logger.info(f"Edit 컨트롤 찾음: {win32gui.GetClassName(edit_hwnd)}")
+            else:
+                self.logger.error(f"Edit 컨트롤을 찾을 수 없음!")
+
+        return edit_hwnd
 
     def get_notepad_text(self, edit_hwnd):
         """메모장 텍스트 읽기"""
@@ -241,7 +263,12 @@ class NotepadAutoSave:
         if not self.config.get('enable_barcode_feature', True):
             return
 
+        if not edit_hwnd:
+            self.logger.error("Edit 컨트롤이 없습니다!")
+            return
+
         current_text = self.get_notepad_text(edit_hwnd)
+        self.logger.debug(f"현재 메모장 내용 (길이: {len(current_text)}): {current_text[:100]}")
 
         # 메모장 내용이 변경되었고, 비어있지 않으면 처리
         if current_text != self.last_content and current_text.strip():
@@ -252,7 +279,14 @@ class NotepadAutoSave:
             if latest_barcode:
                 self.logger.info(f"바코드 감지: {latest_barcode}")
 
-                # 1. 메모장 내용을 최신 바코드만 남기고 삭제 (클립보드 방식)
+                # 무한 루프 방지: 이미 한 줄만 있고 그게 최신 바코드면 스킵
+                if current_text.strip() == latest_barcode.strip():
+                    self.logger.debug(f"이미 마지막 줄만 남아있습니다. 스킵합니다.")
+                    self.last_content = current_text
+                    self.last_barcode = latest_barcode
+                    return
+
+                # 1. 메모장 내용을 최신 바코드만 남기고 삭제
                 if self.set_notepad_text(hwnd, edit_hwnd, latest_barcode):
                     self.logger.info(f"메모장 내용 업데이트: {latest_barcode}만 남김")
 
@@ -261,11 +295,16 @@ class NotepadAutoSave:
                     if self.send_save_command(hwnd):
                         self.logger.info(f"메모장 저장 완료")
 
-                # 2. 별도 파일에도 저장 (같은 내용이어도 타임스탬프 업데이트)
-                self.save_barcode_to_file(latest_barcode)
+                    # 2. 별도 파일에도 저장 (같은 내용이어도 타임스탬프 업데이트)
+                    self.save_barcode_to_file(latest_barcode)
 
-                self.last_barcode = latest_barcode
-                self.last_content = latest_barcode  # 업데이트된 내용으로 변경
+                    self.last_barcode = latest_barcode
+                    self.last_content = latest_barcode  # 업데이트된 내용으로 변경
+                else:
+                    # 텍스트 설정 실패 시 무한 루프 방지
+                    self.logger.error(f"텍스트 설정 실패! 무한 루프 방지를 위해 last_content 업데이트")
+                    self.last_content = current_text
+                    self.last_barcode = latest_barcode
 
     def monitor_loop(self):
         """메인 모니터링 루프"""
