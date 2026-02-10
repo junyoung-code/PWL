@@ -75,9 +75,9 @@ class BarcodeInterceptor:
         self._proc_ref = None
         self.running = False
         self._timer = None
-        self._lock = threading.Lock()
         self._thread_id = None
-        self._suppressed_vks = set()  # 억제된 key-down의 vkCode 추적
+        self._suppressed_vks = set()
+        self._timeout_processing = False  # 타임아웃 처리 중 플래그
 
     def start(self):
         """별도 스레드에서 키보드 훅 시작"""
@@ -121,14 +121,17 @@ class BarcodeInterceptor:
 
     def _on_timeout(self):
         """타임아웃: 바코드가 아니었으므로 억제된 키 재생"""
-        with self._lock:
+        self._timeout_processing = True
+        try:
             if self.suppressing and self.buffer:
                 self.logger.info(f"[인터셉터] 타임아웃 - 버퍼 재생 ({len(self.buffer)}자)")
                 self._replay_buffer()
-            self.buffer.clear()
-            self.buffer_times.clear()
+            self.buffer = []
+            self.buffer_times = []
             self.suppressing = False
-            self._suppressed_vks.clear()
+            self._suppressed_vks = set()
+        finally:
+            self._timeout_processing = False
 
     def _replay_buffer(self):
         """억제했던 키를 원래 창에 재생"""
@@ -167,41 +170,44 @@ class BarcodeInterceptor:
             user32.SendInput(1, byref(inp2), ctypes.sizeof(INPUT))
 
     def _hook_callback(self, nCode, wParam, lParam):
-        """저수준 키보드 훅 콜백"""
-        if nCode < 0:
-            return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+        """저수준 키보드 훅 콜백 (절대 블로킹하지 않음)"""
+        try:
+            if nCode < 0:
+                return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
 
-        kb = ctypes.cast(lParam, POINTER(KBDLLHOOKSTRUCT)).contents
-        vk_code = kb.vkCode
+            # 타임아웃 처리 중이면 모든 키 통과 (블로킹 방지)
+            if self._timeout_processing:
+                return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
 
-        # 우리가 재생한 키는 무시 (LLKHF_INJECTED = 0x10)
-        if kb.flags & 0x10:
-            return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+            kb = ctypes.cast(lParam, POINTER(KBDLLHOOKSTRUCT)).contents
+            vk_code = kb.vkCode
 
-        # WM_KEYUP: 억제된 key-down에 대응하는 key-up도 억제
-        if wParam == WM_KEYUP:
-            with self._lock:
+            # 우리가 재생한 키는 무시 (LLKHF_INJECTED = 0x10)
+            if kb.flags & 0x10:
+                return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+
+            # WM_KEYUP: 억제된 key-down에 대응하는 key-up도 억제
+            if wParam == WM_KEYUP:
                 if vk_code in self._suppressed_vks:
                     self._suppressed_vks.discard(vk_code)
                     return 1
-            return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+                return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
 
-        # WM_KEYDOWN만 처리
-        if wParam != WM_KEYDOWN:
-            return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+            # WM_KEYDOWN만 처리
+            if wParam != WM_KEYDOWN:
+                return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
 
-        current_time = kb.time
+            current_time = kb.time
 
-        # Enter 키
-        if vk_code == VK_RETURN:
-            with self._lock:
+            # Enter 키
+            if vk_code == VK_RETURN:
                 if self._timer:
                     self._timer.cancel()
                 if len(self.buffer) >= self.MIN_BARCODE_LEN and self.suppressing:
                     # 바코드 완성!
                     barcode = ''.join(self.buffer)
-                    self.buffer.clear()
-                    self.buffer_times.clear()
+                    self.buffer = []
+                    self.buffer_times = []
                     self.suppressing = False
                     self._suppressed_vks.add(vk_code)
                     self.logger.info(f"[인터셉터] 바코드 감지: '{barcode}'")
@@ -211,17 +217,16 @@ class BarcodeInterceptor:
                     return 1  # Enter 억제
                 else:
                     # 바코드 아님 - 버퍼 비우기
-                    self.buffer.clear()
-                    self.buffer_times.clear()
+                    self.buffer = []
+                    self.buffer_times = []
                     self.suppressing = False
                     return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
 
-        # 문자 변환 (MapVirtualKeyW - 키보드 상태 오염 없음)
-        char = self._vk_to_char(vk_code)
-        if not char:
-            return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+            # 문자 변환 (MapVirtualKeyW - 키보드 상태 오염 없음)
+            char = self._vk_to_char(vk_code)
+            if not char:
+                return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
 
-        with self._lock:
             is_fast = self._is_fast(current_time)
 
             if is_fast:
@@ -235,17 +240,20 @@ class BarcodeInterceptor:
                     self._suppressed_vks.add(vk_code)
                     return 1  # 억제
             else:
-                # 느린 입력 - 일반 타이핑
+                # 느린 입력 - 일반 타이핑 (그대로 통과)
                 if self.suppressing and self.buffer:
-                    # 이전에 억제 중이었으나 바코드 아님 → 재생
                     self._replay_buffer()
-                self.buffer.clear()
-                self.buffer_times.clear()
+                self.buffer = []
+                self.buffer_times = []
                 self.suppressing = False
-                self._suppressed_vks.clear()
+                self._suppressed_vks = set()
                 self.buffer.append(char)
                 self.buffer_times.append(current_time)
                 self._start_timeout()
+
+        except Exception:
+            # 예외 발생 시 키 무조건 통과 (키보드 절대 안 막힘)
+            pass
 
         return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
 
