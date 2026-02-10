@@ -7,13 +7,11 @@ Notepad Auto-Save with Barcode Support
 - 메모장 변경사항 자동 저장
 - 바코드 감지 및 최신 것만 파일 저장
 - 완전 자동 모드 (확인 불필요)
-- 백그라운드 처리 (방해 최소)
+- UI Automation 방식 (Windows 11 완전 호환)
 """
 
 import win32gui
 import win32con
-import win32api
-import win32clipboard
 import time
 import json
 import logging
@@ -23,17 +21,14 @@ import sys
 import tkinter as tk
 from tkinter import messagebox
 
+# UI Automation
+import uiautomation as auto
+
 
 class NotepadAutoSave:
     """메모장 자동 저장 + 바코드 처리 클래스"""
 
     def __init__(self, config_file='config.json'):
-        """
-        초기화
-
-        Args:
-            config_file: 설정 파일 경로
-        """
         self.config = self.load_config(config_file)
         self.setup_logging()
 
@@ -45,8 +40,11 @@ class NotepadAutoSave:
         # 루프 제어
         self.stop_requested = False
 
+        # UIA 메모장 컨트롤 캐시
+        self._uia_edit_cache = {}
+
         self.logger.info("=" * 60)
-        self.logger.info("Notepad Auto-Save with Barcode Support Started")
+        self.logger.info("Notepad Auto-Save (UI Automation 방식)")
         self.logger.info("=" * 60)
 
     def request_stop(self):
@@ -121,323 +119,153 @@ class NotepadAutoSave:
         title = self.get_window_title(hwnd)
         return title.startswith('*')
 
-    def get_edit_control(self, hwnd):
-        """메모장의 편집 컨트롤 찾기"""
-        edit_hwnd = win32gui.FindWindowEx(hwnd, 0, "Edit", None)
-
-        if not edit_hwnd:
-            # Edit 컨트롤을 찾지 못하면 모든 자식 윈도우 검색
-            self.logger.warning(f"Edit 컨트롤을 직접 찾지 못함. 자식 윈도우 검색 중...")
-
-            def enum_child_callback(child_hwnd, results):
-                class_name = win32gui.GetClassName(child_hwnd)
-                self.logger.info(f"  자식 윈도우 발견: {class_name}")
-                # Windows 10, 11 메모장의 다양한 편집 컨트롤 지원
-                if class_name.lower() in ['edit', 'richedit', 'richedit20w', 'richedit50w',
-                                           'richeditd2dpt', 'notepadtextbox']:
-                    results.append(child_hwnd)
-                    self.logger.info(f"  → 편집 컨트롤로 인식: {class_name}")
-                return True
-
-            child_windows = []
-            win32gui.EnumChildWindows(hwnd, enum_child_callback, child_windows)
-
-            if child_windows:
-                edit_hwnd = child_windows[0]
-                self.logger.info(f"Edit 컨트롤 찾음: {win32gui.GetClassName(edit_hwnd)}")
-            else:
-                self.logger.error(f"Edit 컨트롤을 찾을 수 없음!")
-
-        return edit_hwnd
-
-    def open_clipboard_with_retry(self, max_retries=5, delay=0.2):
-        """클립보드를 재시도 로직과 함께 열기"""
-        for attempt in range(max_retries):
+    def get_uia_edit_control(self, hwnd):
+        """UI Automation으로 메모장의 편집 컨트롤 찾기"""
+        # 캐시에 있으면 유효성 확인 후 반환
+        if hwnd in self._uia_edit_cache:
             try:
-                win32clipboard.OpenClipboard()
-                return True
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    self.logger.warning(f"클립보드 열기 실패 (시도 {attempt + 1}/{max_retries}): {e}")
-                    time.sleep(delay * (attempt + 1))  # 지수 백오프
-                else:
-                    self.logger.error(f"클립보드 열기 최종 실패: {e}")
-                    return False
-        return False
+                cached = self._uia_edit_cache[hwnd]
+                # 컨트롤이 아직 유효한지 간단히 확인
+                _ = cached.Name
+                return cached
+            except Exception:
+                del self._uia_edit_cache[hwnd]
 
-    def ensure_notepad_focused(self, hwnd, max_retries=10, save_original=True):
-        """메모장 창에 포커스가 있는지 확인하고 설정 (원래 창 복원 지원)"""
-        # 현재 활성화된 창 기억 (나중에 복원용)
-        original_hwnd = None
-        if save_original:
-            try:
-                original_hwnd = win32gui.GetForegroundWindow()
-                if original_hwnd == hwnd:
-                    # 이미 메모장이 활성화되어 있음
-                    self.logger.info("✓ 메모장이 이미 활성화되어 있음")
-                    return True, None
-            except:
-                pass
-
-        for attempt in range(max_retries):
-            try:
-                # 메모장 창을 최상위로
-                win32gui.SetForegroundWindow(hwnd)
-                time.sleep(0.15)
-
-                # 현재 포커스된 창이 메모장인지 확인
-                current_hwnd = win32gui.GetForegroundWindow()
-                if current_hwnd == hwnd:
-                    self.logger.info(f"✓ 메모장 창 포커스 확인 완료 (시도 {attempt + 1})")
-                    return True, original_hwnd
-                else:
-                    current_title = win32gui.GetWindowText(current_hwnd) if current_hwnd else "None"
-                    self.logger.warning(f"메모장 창 포커스 실패 (시도 {attempt + 1}/{max_retries}): 현재 활성 창='{current_title}'")
-            except Exception as e:
-                self.logger.warning(f"창 활성화 오류 (시도 {attempt + 1}): {e}")
-
-            time.sleep(0.2 * (attempt + 1))  # 지수 백오프
-
-        self.logger.error("✗ 메모장 창 포커스 실패! 다른 프로그램 보호를 위해 키보드 이벤트를 보내지 않습니다.")
-        return False, None
-
-    def restore_original_window(self, original_hwnd):
-        """원래 활성화되어 있던 창으로 복원"""
-        if original_hwnd:
-            try:
-                time.sleep(0.1)  # 메모장 작업 완료 대기
-                win32gui.SetForegroundWindow(original_hwnd)
-                self.logger.info(f"✓ 원래 창으로 복원 완료")
-            except Exception as e:
-                self.logger.warning(f"원래 창 복원 실패: {e}")
-
-    def hide_window_temporarily(self, hwnd):
-        """메모장 창을 화면 밖으로 이동 (작업 시각적으로 숨김)"""
         try:
-            # 원래 위치와 크기 저장
-            rect = win32gui.GetWindowRect(hwnd)
-            original_pos = (rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1])
+            # hwnd로 UIA 윈도우 컨트롤 찾기
+            notepad_control = auto.ControlFromHandle(hwnd)
+            if not notepad_control:
+                self.logger.error("UIA: 메모장 윈도우 컨트롤을 찾을 수 없음")
+                return None
 
-            # 화면 밖으로 이동 (-10000, -10000)
-            win32gui.MoveWindow(hwnd, -10000, -10000, original_pos[2], original_pos[3], True)
-            time.sleep(0.05)  # 이동 완료 대기
+            # 방법 1: DocumentControl 찾기 (Windows 11 메모장)
+            edit_control = notepad_control.DocumentControl()
+            if edit_control and edit_control.Exists(maxSearchSeconds=1):
+                self.logger.info(f"UIA: DocumentControl 발견")
+                self._uia_edit_cache[hwnd] = edit_control
+                return edit_control
 
-            self.logger.info("✓ 메모장 창 임시 숨김 (화면 밖으로 이동)")
-            return original_pos
-        except Exception as e:
-            self.logger.warning(f"창 숨김 실패: {e}")
+            # 방법 2: EditControl 찾기 (Windows 10 메모장)
+            edit_control = notepad_control.EditControl()
+            if edit_control and edit_control.Exists(maxSearchSeconds=1):
+                self.logger.info(f"UIA: EditControl 발견")
+                self._uia_edit_cache[hwnd] = edit_control
+                return edit_control
+
+            self.logger.error("UIA: 편집 컨트롤을 찾을 수 없음")
             return None
 
-    def restore_window_position(self, hwnd, original_pos):
-        """메모장 창을 원래 위치로 복원"""
-        if original_pos:
-            try:
-                win32gui.MoveWindow(hwnd, original_pos[0], original_pos[1], original_pos[2], original_pos[3], True)
-                time.sleep(0.05)  # 이동 완료 대기
-                self.logger.info("✓ 메모장 창 원래 위치로 복원")
-            except Exception as e:
-                self.logger.warning(f"창 위치 복원 실패: {e}")
+        except Exception as e:
+            self.logger.error(f"UIA 편집 컨트롤 검색 오류: {e}")
+            return None
 
-    def get_notepad_text(self, hwnd, edit_hwnd):
-        """메모장 텍스트 읽기 (클립보드 방식 - Windows 11 호환)"""
+    def get_notepad_text(self, hwnd):
+        """UI Automation으로 메모장 텍스트 읽기"""
         try:
-            # 방법 1: WM_GETTEXT 시도 (Windows 10 메모장용)
-            length = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXTLENGTH, 0, 0)
-
-            if length > 0:
-                import ctypes
-                buffer = ctypes.create_unicode_buffer(length + 1)
-                result = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXT, length + 1, buffer)
-                if result > 0:
-                    text = buffer.value
-                    self.logger.debug(f"WM_GETTEXT 성공: '{text[:50]}'")
-                    return text
-
-            # 방법 2: 클립보드 사용 (Windows 11 메모장용)
-            self.logger.info(f"클립보드 방식으로 텍스트 읽기 시도...")
-
-            # 메모장 창 활성화 (키보드 이벤트가 올바른 창으로 가도록)
-            # 중요: 원래 창을 기억했다가 나중에 복원
-            success, original_hwnd = self.ensure_notepad_focused(hwnd, save_original=True)
-            if not success:
-                self.logger.error("메모장 창을 활성화할 수 없어 텍스트 읽기 실패")
+            edit_control = self.get_uia_edit_control(hwnd)
+            if not edit_control:
                 return ""
 
-            # 메모장을 화면 밖으로 이동 (사용자에게 보이지 않도록)
-            window_pos = self.hide_window_temporarily(hwnd)
-
-            # 현재 클립보드 백업
-            old_clipboard = ""
+            # 방법 1: ValuePattern 사용
             try:
-                if self.open_clipboard_with_retry():
-                    if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
-                        old_clipboard = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-                    win32clipboard.CloseClipboard()
-                time.sleep(0.1)  # 클립보드 해제 대기
+                vp = edit_control.GetValuePattern()
+                if vp:
+                    text = vp.Value
+                    self.logger.debug(f"UIA ValuePattern 텍스트 읽기 성공: '{text[:50]}'")
+                    return text
             except Exception as e:
-                self.logger.warning(f"클립보드 백업 실패: {e}")
+                self.logger.debug(f"ValuePattern 실패: {e}")
 
-            # Ctrl+A로 전체 선택
-            VK_CONTROL = win32con.VK_CONTROL
-            VK_A = ord('A')
-            VK_C = ord('C')
-
-            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_A, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_A, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.15)
-
-            # Ctrl+C로 복사
-            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_C, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_C, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.2)  # 복사 완료 대기
-
-            # 클립보드에서 읽기
-            text = ""
+            # 방법 2: TextPattern 사용
             try:
-                if self.open_clipboard_with_retry():
-                    if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
-                        text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-                    win32clipboard.CloseClipboard()
-                    self.logger.info(f"클립보드에서 텍스트 읽기 성공: '{text[:50]}'")
-                time.sleep(0.1)  # 클립보드 해제 대기
+                tp = edit_control.GetTextPattern()
+                if tp:
+                    text = tp.DocumentRange.GetText(-1)
+                    self.logger.debug(f"UIA TextPattern 텍스트 읽기 성공: '{text[:50]}'")
+                    return text
             except Exception as e:
-                self.logger.error(f"클립보드 읽기 오류: {e}")
-                try:
-                    win32clipboard.CloseClipboard()
-                except:
-                    pass
+                self.logger.debug(f"TextPattern 실패: {e}")
 
-            # 원래 클립보드 복원
-            if old_clipboard:
-                try:
-                    time.sleep(0.2)  # 복원 전 충분한 대기
-                    if self.open_clipboard_with_retry():
-                        win32clipboard.EmptyClipboard()
-                        win32clipboard.SetClipboardText(old_clipboard, win32con.CF_UNICODETEXT)
-                        win32clipboard.CloseClipboard()
-                    time.sleep(0.1)
-                except Exception as e:
-                    self.logger.warning(f"클립보드 복원 실패: {e}")
+            # 방법 3: GetWindowText 폴백 (Win32)
+            try:
+                edit_hwnd = win32gui.FindWindowEx(hwnd, 0, "Edit", None)
+                if edit_hwnd:
+                    import ctypes
+                    length = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXTLENGTH, 0, 0)
+                    if length > 0:
+                        buffer = ctypes.create_unicode_buffer(length + 1)
+                        win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXT, length + 1, buffer)
+                        text = buffer.value
+                        self.logger.debug(f"Win32 WM_GETTEXT 폴백 성공: '{text[:50]}'")
+                        return text
+            except Exception as e:
+                self.logger.debug(f"Win32 폴백 실패: {e}")
 
-            # 메모장 창을 원래 위치로 복원
-            self.restore_window_position(hwnd, window_pos)
-
-            # 원래 활성화되어 있던 창으로 복원
-            self.restore_original_window(original_hwnd)
-
-            return text
+            self.logger.warning("모든 텍스트 읽기 방식 실패")
+            return ""
 
         except Exception as e:
             self.logger.error(f"get_notepad_text 오류: {e}", exc_info=True)
             return ""
 
-    def set_notepad_text(self, hwnd, edit_hwnd, text):
-        """메모장 텍스트 설정 (클립보드 방식 - Windows 11 호환)"""
+    def set_notepad_text(self, hwnd, text):
+        """UI Automation으로 메모장 텍스트 설정"""
         try:
-            self.logger.info(f"클립보드 방식으로 텍스트 설정: '{text[:50]}'")
-
-            # 1. 메모장 창 활성화 (키보드 이벤트가 올바른 창으로 가도록)
-            # 중요: 원래 창을 기억했다가 나중에 복원
-            success, original_hwnd = self.ensure_notepad_focused(hwnd, save_original=True)
-            if not success:
-                self.logger.error("메모장 창을 활성화할 수 없어 텍스트 설정 실패")
+            edit_control = self.get_uia_edit_control(hwnd)
+            if not edit_control:
                 return False
 
-            # 메모장을 화면 밖으로 이동 (사용자에게 보이지 않도록)
-            window_pos = self.hide_window_temporarily(hwnd)
-
-            # 2. 클립보드가 완전히 해제될 때까지 대기
-            time.sleep(0.3)
-
-            # 3. 클립보드에 텍스트 복사
-            if not self.open_clipboard_with_retry():
-                self.logger.error("클립보드를 열 수 없습니다")
-                return False
-
+            # 방법 1: ValuePattern 사용
             try:
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
-                win32clipboard.CloseClipboard()
-                self.logger.info("클립보드에 텍스트 설정 완료")
-                time.sleep(0.2)  # 클립보드 해제 대기
+                vp = edit_control.GetValuePattern()
+                if vp:
+                    vp.SetValue(text)
+                    self.logger.info(f"UIA ValuePattern 텍스트 설정 성공: '{text[:50]}'")
+                    return True
             except Exception as e:
-                self.logger.error(f"클립보드 설정 오류: {e}")
-                try:
-                    win32clipboard.CloseClipboard()
-                except:
-                    pass
-                return False
+                self.logger.debug(f"ValuePattern SetValue 실패: {e}")
 
-            # 4. Ctrl+A로 전체 선택
-            VK_CONTROL = win32con.VK_CONTROL
-            VK_A = ord('A')
-            VK_V = ord('V')
+            # 방법 2: 전체 선택 후 텍스트 입력 (SendKeys)
+            try:
+                edit_control.SetFocus()
+                time.sleep(0.05)
 
-            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_A, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_A, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.15)
+                # Ctrl+A로 전체 선택
+                edit_control.SendKeys('{Ctrl}a')
+                time.sleep(0.05)
 
-            # 5. Ctrl+V로 붙여넣기
-            win32api.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_V, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_V, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.3)  # 붙여넣기 완료 대기
+                # 텍스트 입력 (선택된 텍스트를 대체)
+                edit_control.SendKeys(text, interval=0)
+                self.logger.info(f"UIA SendKeys 텍스트 설정 성공: '{text[:50]}'")
+                return True
+            except Exception as e:
+                self.logger.debug(f"SendKeys 실패: {e}")
 
-            self.logger.info(f"텍스트 설정 완료")
+            # 방법 3: Win32 WM_SETTEXT 폴백 (Windows 10)
+            try:
+                edit_hwnd = win32gui.FindWindowEx(hwnd, 0, "Edit", None)
+                if edit_hwnd:
+                    win32gui.SendMessage(edit_hwnd, win32con.WM_SETTEXT, 0, text)
+                    self.logger.info(f"Win32 WM_SETTEXT 폴백 성공: '{text[:50]}'")
+                    return True
+            except Exception as e:
+                self.logger.debug(f"Win32 WM_SETTEXT 폴백 실패: {e}")
 
-            # 메모장 창을 원래 위치로 복원
-            self.restore_window_position(hwnd, window_pos)
-
-            # 원래 활성화되어 있던 창으로 복원
-            self.restore_original_window(original_hwnd)
-
-            return True
+            self.logger.error("모든 텍스트 설정 방식 실패")
+            return False
 
         except Exception as e:
             self.logger.error(f"set_notepad_text 오류: {e}", exc_info=True)
-
-            # 오류 발생 시에도 원래 위치/창으로 복원
-            try:
-                self.restore_window_position(hwnd, window_pos)
-                self.restore_original_window(original_hwnd)
-            except:
-                pass
-
             return False
 
     def extract_latest_barcode(self, text):
-        """텍스트에서 최신 바코드 추출 (8자리 이상 숫자 또는 모든 텍스트)"""
+        """텍스트에서 최신 바코드 추출 (마지막 비어있지 않은 줄)"""
         lines = text.strip().split('\n')
 
         for line in reversed(lines):
             line = line.strip()
-            # 8자리 이상 숫자 우선, 없으면 마지막 줄 반환
             if line:
-                # 숫자 8자리 이상이면 바코드
-                if line.isdigit() and len(line) >= 8:
-                    return line
-                # 숫자가 아니어도 마지막 줄이면 반환
-                elif line:
-                    return line
+                return line
 
         return None
 
@@ -456,34 +284,23 @@ class NotepadAutoSave:
             self.logger.error(f"바코드 파일 저장 오류: {e}")
 
     def send_save_command(self, hwnd):
-        """메모장 창에 직접 저장 명령 전송 (다른 프로그램에 영향 없음)"""
+        """메모장 창에 직접 저장 명령 전송"""
         try:
-            # WM_COMMAND with IDFILE_SAVE (메모장의 저장 명령)
-            # 메뉴 ID: File > Save = 3 (0x0003)
             WM_COMMAND = 0x0111
             IDFILE_SAVE = 3
-
-            # 메모장 창에만 저장 명령 전송 (다른 프로그램에 영향 없음)
             win32gui.SendMessage(hwnd, WM_COMMAND, IDFILE_SAVE, 0)
-
             return True
         except Exception as e:
             self.logger.error(f"저장 명령 전송 오류: {e}")
             return False
 
-    def process_notepad_content(self, hwnd, edit_hwnd):
+    def process_notepad_content(self, hwnd):
         """메모장 내용 처리 (바코드 추출 및 메모장 업데이트)"""
         if not self.config.get('enable_barcode_feature', True):
-            self.logger.info("바코드 기능이 비활성화되어 있습니다.")
             return
 
-        if not edit_hwnd:
-            self.logger.error("Edit 컨트롤이 없습니다!")
-            return
-
-        current_text = self.get_notepad_text(hwnd, edit_hwnd)
+        current_text = self.get_notepad_text(hwnd)
         self.logger.info(f"[디버그] 현재 메모장 내용 (길이: {len(current_text)}): '{current_text[:100]}'")
-        self.logger.info(f"[디버그] 이전 내용 (길이: {len(self.last_content)}): '{self.last_content[:100] if self.last_content else 'None'}'")
 
         # 메모장 내용이 비어있으면 스킵
         if not current_text.strip():
@@ -501,9 +318,8 @@ class NotepadAutoSave:
         latest_barcode = self.extract_latest_barcode(current_text)
         self.logger.info(f"[디버그] 추출된 바코드: '{latest_barcode}'")
 
-        # 바코드가 추출되면 항상 처리 (같은 내용이어도!)
         if latest_barcode:
-            self.logger.info(f"✓ 바코드 감지: '{latest_barcode}'")
+            self.logger.info(f"바코드 감지: '{latest_barcode}'")
 
             # 무한 루프 방지: 이미 한 줄만 있고 그게 최신 바코드면 스킵
             if current_text.strip() == latest_barcode.strip():
@@ -514,71 +330,26 @@ class NotepadAutoSave:
 
             self.logger.info(f"[디버그] 여러 줄 감지됨. 마지막 줄만 남기기 시작...")
 
-            # 1. 메모장 내용을 최신 바코드만 남기고 삭제
-            if self.set_notepad_text(hwnd, edit_hwnd, latest_barcode):
-                self.logger.info(f"✓ 메모장 내용 업데이트 성공: '{latest_barcode}'만 남김")
+            # 메모장 내용을 최신 바코드만 남기고 삭제
+            if self.set_notepad_text(hwnd, latest_barcode):
+                self.logger.info(f"메모장 내용 업데이트 성공: '{latest_barcode}'만 남김")
 
-                # 강제 저장 (내용 변경 후)
+                # 강제 저장
                 time.sleep(0.1)
                 if self.send_save_command(hwnd):
-                    self.logger.info(f"✓ 메모장 저장 완료")
+                    self.logger.info(f"메모장 저장 완료")
 
-                # 2. 별도 파일에도 저장 (같은 내용이어도 타임스탬프 업데이트)
+                # 별도 파일에도 저장
                 self.save_barcode_to_file(latest_barcode)
 
                 self.last_barcode = latest_barcode
-                self.last_content = latest_barcode  # 업데이트된 내용으로 변경
+                self.last_content = latest_barcode
             else:
-                # 텍스트 설정 실패 시 무한 루프 방지
-                self.logger.error(f"✗ 텍스트 설정 실패! 무한 루프 방지를 위해 last_content 업데이트")
+                self.logger.error(f"텍스트 설정 실패! 무한 루프 방지를 위해 last_content 업데이트")
                 self.last_content = current_text
                 self.last_barcode = latest_barcode
         else:
             self.logger.warning(f"[디버그] 바코드를 추출할 수 없습니다.")
-
-    def monitor_loop(self):
-        """메인 모니터링 루프"""
-        check_interval = self.config['check_interval']
-        barcode_enabled = self.config.get('enable_barcode_feature', True)
-
-        self.logger.info(f"모니터링 시작 (체크 주기: {check_interval}초)")
-        if barcode_enabled:
-            self.logger.info(f"바코드 기능: 활성화 (저장 위치: {self.barcode_output_file})")
-        else:
-            self.logger.info(f"바코드 기능: 비활성화")
-
-        try:
-            while not self.stop_requested:
-                notepad_windows = self.find_notepad_windows()
-
-                if notepad_windows:
-                    self.logger.debug(f"발견된 메모장 창: {len(notepad_windows)}개")
-
-                    for hwnd in notepad_windows:
-                        title = self.get_window_title(hwnd)
-
-                        # 1. 자동 저장 처리
-                        if self.has_unsaved_changes(hwnd):
-                            self.logger.info(f"변경사항 감지: '{title}'")
-
-                            if self.send_save_command(hwnd):
-                                self.logger.info(f"자동 저장 완료: '{title}'")
-                            else:
-                                self.logger.warning(f"자동 저장 실패: '{title}'")
-
-                        # 2. 바코드 처리
-                        edit_hwnd = self.get_edit_control(hwnd)
-                        if edit_hwnd:
-                            self.process_notepad_content(hwnd, edit_hwnd)
-
-                time.sleep(check_interval)
-
-            self.logger.info("모니터링 루프 종료 완료")
-
-        except KeyboardInterrupt:
-            self.logger.info("\n프로그램 종료 (Ctrl+C)")
-        except Exception as e:
-            self.logger.error(f"모니터링 오류: {e}", exc_info=True)
 
 
 def main():
@@ -592,8 +363,9 @@ def main():
         "Notepad Auto-Save",
         "메모장 자동 저장 프로그램을 시작하시겠습니까?\n\n"
         "기능:\n"
-        "✅ 메모장 자동 저장\n"
-        "✅ 바코드 최신 것만 추출 (자동)"
+        "- 메모장 자동 저장\n"
+        "- 바코드 최신 것만 추출 (자동)\n\n"
+        "방식: UI Automation (클립보드 사용 안 함)"
     )
     if not start:
         return
@@ -603,13 +375,14 @@ def main():
 
     # 종료 버튼이 있는 작은 창
     ui = tk.Tk()
-    ui.title("Noㅇtepad Auto-Save (실행 중)")
+    ui.title("Notepad Auto-Save (실행 중)")
     ui.resizable(False, False)
 
     label = tk.Label(
         ui,
         text="메모장 자동 저장이 실행 중입니다.\n"
-             "바코드 기능도 활성화되었습니다.\n\n"
+             "바코드 기능도 활성화되었습니다.\n"
+             "(UI Automation 방식)\n\n"
              "끝내려면 아래 버튼을 누르세요.",
         justify=tk.LEFT
     )
@@ -622,7 +395,6 @@ def main():
     exit_btn = tk.Button(ui, text="끝내기", command=on_exit, width=20)
     exit_btn.pack(padx=20, pady=(0, 15))
 
-    # 창 X를 눌러도 동일하게 종료
     ui.protocol("WM_DELETE_WINDOW", on_exit)
 
     # UI 이벤트 루프와 자동 저장 루프 통합
@@ -646,9 +418,7 @@ def main():
                         autosaver.logger.warning(f"자동 저장 실패: '{title}'")
 
                 # 바코드 처리
-                edit_hwnd = autosaver.get_edit_control(hwnd)
-                if edit_hwnd:
-                    autosaver.process_notepad_content(hwnd, edit_hwnd)
+                autosaver.process_notepad_content(hwnd)
 
         # 다음 실행 예약
         ui.after(int(check_interval * 1000), tick)
