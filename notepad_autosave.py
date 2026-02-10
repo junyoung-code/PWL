@@ -271,6 +271,9 @@ class NotepadAutoSave:
         self.config = self.load_config(config_file)
         self.setup_logging()
 
+        # 타겟 메모장 파일
+        self.target_notepad_file = self.config.get('target_notepad_file', '')
+
         # 바코드 처리용 변수
         self.last_content = ""
         self.last_barcode = ""
@@ -292,6 +295,8 @@ class NotepadAutoSave:
 
         self.logger.info("=" * 60)
         self.logger.info("Notepad Auto-Save (UI Automation + 바코드 인터셉터)")
+        if self.target_notepad_file:
+            self.logger.info(f"타겟 메모장 파일: {self.target_notepad_file}")
         self.logger.info("=" * 60)
 
     def start_interceptor(self):
@@ -337,7 +342,8 @@ class NotepadAutoSave:
             'log_file': 'autosave.log',
             'barcode_output_file': 'barcode_latest.txt',
             'enable_barcode_feature': True,
-            'enable_barcode_interceptor': True
+            'enable_barcode_interceptor': True,
+            'target_notepad_file': 'AA.txt'
         }
 
         if os.path.exists(config_file):
@@ -384,18 +390,60 @@ class NotepadAutoSave:
         win32gui.EnumWindows(enum_callback, notepad_windows)
         return notepad_windows
 
+    def find_target_notepad(self):
+        """타겟 파일이 열린 메모장 창 찾기"""
+        if not self.target_notepad_file:
+            return self.find_notepad_windows()
+
+        all_windows = self.find_notepad_windows()
+        target_name = self.target_notepad_file.lower()
+
+        for hwnd in all_windows:
+            title = self.get_window_title(hwnd).lower()
+            # 메모장 타이틀: "AA.txt - 메모장" 또는 "*AA.txt - 메모장"
+            if target_name in title:
+                return [hwnd]
+
+        return []
+
+    def get_target_file_path(self):
+        """타겟 파일의 절대 경로 반환"""
+        if not self.target_notepad_file:
+            return None
+        # exe 실행 경로 기준으로 절대 경로 생성
+        if os.path.isabs(self.target_notepad_file):
+            return self.target_notepad_file
+        base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        return os.path.join(base_dir, self.target_notepad_file)
+
     def ensure_notepad_running(self):
-        """메모장이 실행 중이 아니면 자동으로 실행"""
-        notepad_windows = self.find_notepad_windows()
+        """타겟 메모장이 실행 중이 아니면 자동으로 실행"""
+        notepad_windows = self.find_target_notepad()
         if not notepad_windows:
-            self.logger.info("메모장이 실행 중이 아닙니다. 자동으로 실행합니다...")
+            target_path = self.get_target_file_path()
+            if target_path:
+                # 타겟 파일이 없으면 생성
+                if not os.path.exists(target_path):
+                    try:
+                        with open(target_path, 'w', encoding='utf-8') as f:
+                            f.write('')
+                        self.logger.info(f"타겟 파일 생성: {target_path}")
+                    except Exception as e:
+                        self.logger.error(f"타겟 파일 생성 실패: {e}")
+
+                self.logger.info(f"타겟 메모장({self.target_notepad_file})이 실행 중이 아닙니다. 자동으로 실행합니다...")
+                cmd = ['notepad.exe', target_path]
+            else:
+                self.logger.info("메모장이 실행 중이 아닙니다. 자동으로 실행합니다...")
+                cmd = ['notepad.exe']
+
             try:
-                subprocess.Popen(['notepad.exe'])
+                subprocess.Popen(cmd)
                 for _ in range(20):
                     time.sleep(0.3)
-                    notepad_windows = self.find_notepad_windows()
+                    notepad_windows = self.find_target_notepad()
                     if notepad_windows:
-                        self.logger.info("메모장 자동 실행 완료")
+                        self.logger.info(f"메모장 자동 실행 완료: {self.target_notepad_file or '새 파일'}")
                         return notepad_windows
                 self.logger.warning("메모장 자동 실행 후 창을 찾지 못함")
             except Exception as e:
@@ -636,7 +684,7 @@ def main():
         "기능:\n"
         "- 메모장 자동 저장\n"
         "- 바코드 스캐너 입력 자동 감지\n"
-        "- 어떤 창에서든 바코드 → 메모장으로 전송\n\n"
+        "- 어떤 창에서든 바코드 → 메모장(AA.txt)으로 전송\n\n"
         "방식: UI Automation + 키보드 훅"
     )
     if not start:
@@ -652,12 +700,14 @@ def main():
     ui.title("Notepad Auto-Save (실행 중)")
     ui.resizable(False, False)
 
+    target_file = autosaver.target_notepad_file or "(모든 메모장)"
     label = tk.Label(
         ui,
-        text="메모장 자동 저장이 실행 중입니다.\n"
-             "바코드 스캐너 입력을 자동 감지합니다.\n"
-             "(어떤 창에서든 메모장으로 전송)\n\n"
-             "끝내려면 아래 버튼을 누르세요.",
+        text=f"메모장 자동 저장이 실행 중입니다.\n"
+             f"타겟 파일: {target_file}\n"
+             f"바코드 스캐너 입력을 자동 감지합니다.\n"
+             f"(어떤 창에서든 {target_file}으로 전송)\n\n"
+             f"끝내려면 아래 버튼을 누르세요.",
         justify=tk.LEFT
     )
     label.pack(padx=20, pady=15)
@@ -679,16 +729,17 @@ def main():
 
         notepad_windows = autosaver.ensure_notepad_running()
         if notepad_windows:
-            for hwnd in notepad_windows:
-                title = autosaver.get_window_title(hwnd)
+            # 타겟 메모장만 처리 (find_target_notepad가 이미 필터링함)
+            hwnd = notepad_windows[0]
+            title = autosaver.get_window_title(hwnd)
 
-                if autosaver.has_unsaved_changes(hwnd):
-                    autosaver.logger.info(f"변경사항 감지: '{title}'")
-                    if autosaver.send_save_command(hwnd):
-                        autosaver.logger.info(f"자동 저장 완료: '{title}'")
+            if autosaver.has_unsaved_changes(hwnd):
+                autosaver.logger.info(f"변경사항 감지: '{title}'")
+                if autosaver.send_save_command(hwnd):
+                    autosaver.logger.info(f"자동 저장 완료: '{title}'")
 
-                # 메모장 직접 입력 감지 (인터셉터와 병행)
-                autosaver.process_notepad_content(hwnd)
+            # 메모장 직접 입력 감지 (인터셉터와 병행)
+            autosaver.process_notepad_content(hwnd)
 
         ui.after(int(check_interval * 1000), tick)
 

@@ -4,5 +4,6 @@
   "log_file": "autosave.log",
   "barcode_output_file": "barcode_latest.txt",
   "enable_barcode_feature": true,
-  "enable_barcode_interceptor": true
+  "enable_barcode_interceptor": true,
+  "target_notepad_file": "AA.txt"
 }

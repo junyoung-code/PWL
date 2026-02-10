@@ -108,6 +108,13 @@ REM Copy config file to dist folder
 echo.
 echo Copying config file...
 copy config.json dist\config.json >nul
+
+REM Create AA.txt target file if not exists
+if not exist AA.txt (
+    echo. > AA.txt
+    echo Created AA.txt target file
+)
+copy AA.txt dist\AA.txt >nul
 echo.
 
 REM ========================================
