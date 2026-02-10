@@ -3,5 +3,6 @@
   "enable_logging": true,
   "log_file": "autosave.log",
   "barcode_output_file": "barcode_latest.txt",
-  "enable_barcode_feature": true
+  "enable_barcode_feature": true,
+  "enable_barcode_interceptor": true
 }

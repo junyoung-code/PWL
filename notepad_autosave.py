@@ -6,7 +6,7 @@ Notepad Auto-Save with Barcode Support
 
 - 메모장 변경사항 자동 저장
 - 바코드 감지 및 최신 것만 파일 저장
-- 완전 자동 모드 (확인 불필요)
+- 바코드 스캐너 입력 인터셉트 (어떤 창에서든 메모장으로 리다이렉트)
 - UI Automation 방식 (Windows 11 완전 호환)
 """
 
@@ -19,13 +19,251 @@ from datetime import datetime
 import os
 import sys
 import subprocess
+import ctypes
+from ctypes import wintypes, POINTER, Structure, CFUNCTYPE, c_long, c_int, byref
+import threading
 import tkinter as tk
 from tkinter import messagebox
 
 # UI Automation
 import uiautomation as auto
 
+# ============================================================
+# 키보드 훅 상수 및 구조체
+# ============================================================
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+VK_RETURN = 0x0D
 
+user32 = ctypes.windll.user32
+
+
+class KBDLLHOOKSTRUCT(Structure):
+    _fields_ = [
+        ('vkCode', wintypes.DWORD),
+        ('scanCode', wintypes.DWORD),
+        ('flags', wintypes.DWORD),
+        ('time', wintypes.DWORD),
+        ('dwExtraInfo', POINTER(ctypes.c_ulong)),
+    ]
+
+
+HOOKPROC = CFUNCTYPE(c_long, c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+
+class BarcodeInterceptor:
+    """
+    키보드 훅으로 바코드 스캐너 입력을 감지하여 메모장으로 리다이렉트
+
+    바코드 스캐너는 매우 빠른 속도로 문자를 입력 (< 50ms/키)
+    → 일반 타이핑과 구별하여, 바코드 입력만 차단 후 메모장에 전송
+    """
+
+    SPEED_THRESHOLD_MS = 50   # 바코드 스캐너 속도 기준 (ms)
+    MIN_BARCODE_LEN = 3       # 최소 바코드 길이
+    BUFFER_TIMEOUT_S = 0.15   # 버퍼 타임아웃 (초)
+
+    def __init__(self, on_barcode_callback, logger):
+        self.on_barcode = on_barcode_callback
+        self.logger = logger
+        self.buffer = []
+        self.buffer_times = []
+        self.suppressing = False
+        self.hook_id = None
+        self._proc_ref = None
+        self.running = False
+        self._timer = None
+        self._lock = threading.Lock()
+        self._thread_id = None
+
+    def start(self):
+        """별도 스레드에서 키보드 훅 시작"""
+        self.running = True
+        thread = threading.Thread(target=self._run, daemon=True)
+        thread.start()
+
+    def stop(self):
+        """키보드 훅 해제"""
+        self.running = False
+        if self._timer:
+            self._timer.cancel()
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(
+                self._thread_id, 0x0012, 0, 0  # WM_QUIT
+            )
+
+    def _vk_to_char(self, vk_code, scan_code):
+        """Virtual Key 코드를 문자로 변환"""
+        keyboard_state = (ctypes.c_ubyte * 256)()
+        user32.GetKeyboardState(keyboard_state)
+        buf = (ctypes.c_wchar * 4)()
+        result = user32.ToUnicode(vk_code, scan_code, keyboard_state, buf, 4, 0)
+        if result > 0:
+            return buf[0]
+        return None
+
+    def _is_fast(self, current_time):
+        """이전 키와의 시간 간격이 빠른지 확인"""
+        if not self.buffer_times:
+            return False
+        delta = current_time - self.buffer_times[-1]
+        return 0 < delta < self.SPEED_THRESHOLD_MS
+
+    def _start_timeout(self):
+        """타임아웃 타이머 (재)시작"""
+        if self._timer:
+            self._timer.cancel()
+        self._timer = threading.Timer(self.BUFFER_TIMEOUT_S, self._on_timeout)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _on_timeout(self):
+        """타임아웃: 바코드가 아니었으므로 억제된 키 재생"""
+        with self._lock:
+            if self.suppressing and self.buffer:
+                self.logger.info(f"[인터셉터] 타임아웃 - 버퍼 재생 ({len(self.buffer)}자)")
+                self._replay_buffer()
+            self.buffer.clear()
+            self.buffer_times.clear()
+            self.suppressing = False
+
+    def _replay_buffer(self):
+        """억제했던 키를 원래 창에 재생"""
+        INPUT_KEYBOARD = 1
+        KEYEVENTF_UNICODE = 0x0004
+        KEYEVENTF_KEYUP = 0x0002
+
+        class KEYBDINPUT(Structure):
+            _fields_ = [
+                ('wVk', wintypes.WORD),
+                ('wScan', wintypes.WORD),
+                ('dwFlags', wintypes.DWORD),
+                ('time', wintypes.DWORD),
+                ('dwExtraInfo', POINTER(ctypes.c_ulong)),
+            ]
+
+        class INPUT(Structure):
+            _fields_ = [
+                ('type', wintypes.DWORD),
+                ('ki', KEYBDINPUT),
+                ('padding', ctypes.c_ubyte * 8),
+            ]
+
+        for char in self.buffer:
+            # Key down
+            inp = INPUT()
+            inp.type = INPUT_KEYBOARD
+            inp.ki.wScan = ord(char)
+            inp.ki.dwFlags = KEYEVENTF_UNICODE
+            user32.SendInput(1, byref(inp), ctypes.sizeof(INPUT))
+            # Key up
+            inp2 = INPUT()
+            inp2.type = INPUT_KEYBOARD
+            inp2.ki.wScan = ord(char)
+            inp2.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+            user32.SendInput(1, byref(inp2), ctypes.sizeof(INPUT))
+
+    def _hook_callback(self, nCode, wParam, lParam):
+        """저수준 키보드 훅 콜백"""
+        if nCode < 0 or wParam != WM_KEYDOWN:
+            return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+
+        kb = ctypes.cast(lParam, POINTER(KBDLLHOOKSTRUCT)).contents
+        vk_code = kb.vkCode
+        current_time = kb.time
+
+        # 우리가 재생한 키는 무시 (dwExtraInfo로 구분 불가하므로 flags 확인)
+        # LLKHF_INJECTED = 0x10
+        if kb.flags & 0x10:
+            return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+
+        # Enter 키
+        if vk_code == VK_RETURN:
+            with self._lock:
+                if self._timer:
+                    self._timer.cancel()
+                if len(self.buffer) >= self.MIN_BARCODE_LEN and self.suppressing:
+                    # 바코드 완성!
+                    barcode = ''.join(self.buffer)
+                    self.buffer.clear()
+                    self.buffer_times.clear()
+                    self.suppressing = False
+                    self.logger.info(f"[인터셉터] 바코드 감지: '{barcode}'")
+                    threading.Thread(
+                        target=self.on_barcode, args=(barcode,), daemon=True
+                    ).start()
+                    return 1  # Enter 억제
+                else:
+                    # 바코드 아님 - 버퍼 비우기
+                    self.buffer.clear()
+                    self.buffer_times.clear()
+                    self.suppressing = False
+                    return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+
+        # 문자 변환
+        char = self._vk_to_char(vk_code, kb.scanCode)
+        if not char or not char.isprintable():
+            return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+
+        with self._lock:
+            is_fast = self._is_fast(current_time)
+
+            if is_fast:
+                # 빠른 입력 - 바코드 가능성
+                self.buffer.append(char)
+                self.buffer_times.append(current_time)
+                if len(self.buffer) >= 2:
+                    self.suppressing = True
+                self._start_timeout()
+                if self.suppressing:
+                    return 1  # 억제
+            else:
+                # 느린 입력 - 일반 타이핑
+                if self.suppressing and self.buffer:
+                    # 이전에 억제 중이었으나 바코드 아님 → 재생
+                    self._replay_buffer()
+                self.buffer.clear()
+                self.buffer_times.clear()
+                self.suppressing = False
+                self.buffer.append(char)
+                self.buffer_times.append(current_time)
+                self._start_timeout()
+
+        return user32.CallNextHookEx(self.hook_id, nCode, wParam, lParam)
+
+    def _run(self):
+        """훅 스레드 메인 루프"""
+        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+
+        self._proc_ref = HOOKPROC(self._hook_callback)
+        self.hook_id = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._proc_ref, None, 0
+        )
+
+        if not self.hook_id:
+            self.logger.error(f"키보드 훅 설치 실패 (에러: {ctypes.GetLastError()})")
+            return
+
+        self.logger.info("키보드 훅 설치 완료 - 바코드 스캐너 입력 감지 대기 중")
+
+        # 메시지 펌프 (훅이 작동하려면 필요)
+        msg = wintypes.MSG()
+        while self.running:
+            result = user32.GetMessageW(byref(msg), None, 0, 0)
+            if result <= 0:
+                break
+            user32.TranslateMessage(byref(msg))
+            user32.DispatchMessageW(byref(msg))
+
+        if self.hook_id:
+            user32.UnhookWindowsHookEx(self.hook_id)
+            self.hook_id = None
+        self.logger.info("키보드 훅 해제 완료")
+
+
+# ============================================================
+# 메인 클래스
+# ============================================================
 class NotepadAutoSave:
     """메모장 자동 저장 + 바코드 처리 클래스"""
 
@@ -44,14 +282,52 @@ class NotepadAutoSave:
         # UIA 메모장 컨트롤 캐시
         self._uia_edit_cache = {}
 
+        # 바코드 인터셉터
+        self.interceptor = None
+        if self.config.get('enable_barcode_interceptor', True):
+            self.interceptor = BarcodeInterceptor(
+                on_barcode_callback=self.on_barcode_intercepted,
+                logger=self.logger
+            )
+
         self.logger.info("=" * 60)
-        self.logger.info("Notepad Auto-Save (UI Automation 방식)")
+        self.logger.info("Notepad Auto-Save (UI Automation + 바코드 인터셉터)")
         self.logger.info("=" * 60)
+
+    def start_interceptor(self):
+        """바코드 인터셉터 시작"""
+        if self.interceptor:
+            self.interceptor.start()
 
     def request_stop(self):
         """외부(UI)에서 종료 요청할 때 호출"""
         self.stop_requested = True
+        if self.interceptor:
+            self.interceptor.stop()
         self.logger.info("종료 요청을 받았습니다. 프로그램을 종료합니다...")
+
+    def on_barcode_intercepted(self, barcode):
+        """바코드 인터셉터로부터 바코드를 수신했을 때 (별도 스레드에서 호출됨)"""
+        self.logger.info(f"[인터셉터 → 메모장] 바코드 수신: '{barcode}'")
+
+        # 메모장 확보
+        notepad_windows = self.ensure_notepad_running()
+        if not notepad_windows:
+            self.logger.error("[인터셉터] 메모장을 찾을 수 없습니다")
+            return
+
+        hwnd = notepad_windows[0]
+
+        # 메모장에 바코드 쓰기
+        if self.set_notepad_text(hwnd, barcode):
+            self.logger.info(f"[인터셉터] 메모장에 바코드 쓰기 성공: '{barcode}'")
+            time.sleep(0.1)
+            self.send_save_command(hwnd)
+            self.save_barcode_to_file(barcode)
+            self.last_barcode = barcode
+            self.last_content = barcode
+        else:
+            self.logger.error(f"[인터셉터] 메모장에 바코드 쓰기 실패: '{barcode}'")
 
     def load_config(self, config_file):
         """설정 파일 로드"""
@@ -60,7 +336,8 @@ class NotepadAutoSave:
             'enable_logging': True,
             'log_file': 'autosave.log',
             'barcode_output_file': 'barcode_latest.txt',
-            'enable_barcode_feature': True
+            'enable_barcode_feature': True,
+            'enable_barcode_interceptor': True
         }
 
         if os.path.exists(config_file):
@@ -114,7 +391,6 @@ class NotepadAutoSave:
             self.logger.info("메모장이 실행 중이 아닙니다. 자동으로 실행합니다...")
             try:
                 subprocess.Popen(['notepad.exe'])
-                # 메모장이 완전히 열릴 때까지 대기
                 for _ in range(20):
                     time.sleep(0.3)
                     notepad_windows = self.find_notepad_windows()
@@ -140,34 +416,29 @@ class NotepadAutoSave:
 
     def get_uia_edit_control(self, hwnd):
         """UI Automation으로 메모장의 편집 컨트롤 찾기"""
-        # 캐시에 있으면 유효성 확인 후 반환
         if hwnd in self._uia_edit_cache:
             try:
                 cached = self._uia_edit_cache[hwnd]
-                # 컨트롤이 아직 유효한지 간단히 확인
                 _ = cached.Name
                 return cached
             except Exception:
                 del self._uia_edit_cache[hwnd]
 
         try:
-            # hwnd로 UIA 윈도우 컨트롤 찾기
             notepad_control = auto.ControlFromHandle(hwnd)
             if not notepad_control:
                 self.logger.error("UIA: 메모장 윈도우 컨트롤을 찾을 수 없음")
                 return None
 
-            # 방법 1: DocumentControl 찾기 (Windows 11 메모장)
             edit_control = notepad_control.DocumentControl()
             if edit_control and edit_control.Exists(maxSearchSeconds=1):
-                self.logger.info(f"UIA: DocumentControl 발견")
+                self.logger.info("UIA: DocumentControl 발견")
                 self._uia_edit_cache[hwnd] = edit_control
                 return edit_control
 
-            # 방법 2: EditControl 찾기 (Windows 10 메모장)
             edit_control = notepad_control.EditControl()
             if edit_control and edit_control.Exists(maxSearchSeconds=1):
-                self.logger.info(f"UIA: EditControl 발견")
+                self.logger.info("UIA: EditControl 발견")
                 self._uia_edit_cache[hwnd] = edit_control
                 return edit_control
 
@@ -179,8 +450,7 @@ class NotepadAutoSave:
             return None
 
     def normalize_line_endings(self, text):
-        """줄바꿈 문자를 \n으로 통일 (Windows 11 UIA는 \r만 사용할 수 있음)"""
-        # \r\n → \n 먼저 처리, 그 다음 남은 \r → \n
+        """줄바꿈 문자를 \\n으로 통일"""
         text = text.replace('\r\n', '\n')
         text = text.replace('\r', '\n')
         return text
@@ -192,47 +462,36 @@ class NotepadAutoSave:
             if not edit_control:
                 return ""
 
-            # 방법 1: TextPattern 사용 (멀티라인 텍스트에 가장 정확)
             try:
                 tp = edit_control.GetTextPattern()
                 if tp:
                     text = tp.DocumentRange.GetText(-1)
                     if text:
                         text = self.normalize_line_endings(text)
-                        lines = [l for l in text.split('\n') if l.strip()]
-                        self.logger.info(f"[TextPattern] 텍스트 읽기 성공 (길이: {len(text)}, 유효줄수: {len(lines)})")
                         return text
-            except Exception as e:
-                self.logger.info(f"[TextPattern] 실패: {e}")
+            except Exception:
+                pass
 
-            # 방법 2: ValuePattern 사용 (단일 라인 또는 간단한 텍스트)
             try:
                 vp = edit_control.GetValuePattern()
                 if vp:
                     text = vp.Value
                     if text:
-                        text = self.normalize_line_endings(text)
-                        self.logger.info(f"[ValuePattern] 텍스트 읽기 성공 (길이: {len(text)})")
-                        return text
-            except Exception as e:
-                self.logger.info(f"[ValuePattern] 실패: {e}")
+                        return self.normalize_line_endings(text)
+            except Exception:
+                pass
 
-            # 방법 3: WM_GETTEXT 폴백 (Win32 - Windows 10)
             try:
                 edit_hwnd = win32gui.FindWindowEx(hwnd, 0, "Edit", None)
                 if edit_hwnd:
-                    import ctypes
                     length = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXTLENGTH, 0, 0)
                     if length > 0:
                         buffer = ctypes.create_unicode_buffer(length + 1)
                         win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXT, length + 1, buffer)
-                        text = buffer.value
-                        self.logger.info(f"[WM_GETTEXT] 폴백 성공 (길이: {len(text)})")
-                        return text
-            except Exception as e:
-                self.logger.info(f"[WM_GETTEXT] 폴백 실패: {e}")
+                        return buffer.value
+            except Exception:
+                pass
 
-            self.logger.warning("모든 텍스트 읽기 방식 실패")
             return ""
 
         except Exception as e:
@@ -246,7 +505,6 @@ class NotepadAutoSave:
             if not edit_control:
                 return False
 
-            # 방법 1: ValuePattern 사용
             try:
                 vp = edit_control.GetValuePattern()
                 if vp:
@@ -256,7 +514,6 @@ class NotepadAutoSave:
             except Exception as e:
                 self.logger.info(f"[ValuePattern] SetValue 실패: {e}")
 
-            # 방법 2: TextPattern으로 전체 선택 후 ValuePattern으로 설정
             try:
                 tp = edit_control.GetTextPattern()
                 if tp:
@@ -270,7 +527,6 @@ class NotepadAutoSave:
             except Exception as e:
                 self.logger.info(f"[TextPattern+ValuePattern] 실패: {e}")
 
-            # 방법 3: SendKeys로 전체 선택 후 텍스트 입력
             try:
                 edit_control.SetFocus()
                 time.sleep(0.05)
@@ -282,7 +538,6 @@ class NotepadAutoSave:
             except Exception as e:
                 self.logger.info(f"[SendKeys] 실패: {e}")
 
-            # 방법 4: Win32 WM_SETTEXT 폴백 (Windows 10)
             try:
                 edit_hwnd = win32gui.FindWindowEx(hwnd, 0, "Edit", None)
                 if edit_hwnd:
@@ -302,25 +557,20 @@ class NotepadAutoSave:
     def extract_latest_barcode(self, text):
         """텍스트에서 최신 바코드 추출 (마지막 비어있지 않은 줄)"""
         lines = text.strip().split('\n')
-
         for line in reversed(lines):
             line = line.strip()
             if line:
                 return line
-
         return None
 
     def save_barcode_to_file(self, barcode):
         """바코드를 별도 파일에 저장 (최신 것만)"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
         try:
             with open(self.barcode_output_file, 'w', encoding='utf-8') as f:
                 f.write(f"최근 스캔 시간: {timestamp}\n")
                 f.write(f"바코드: {barcode}\n")
-
             self.logger.info(f"바코드 저장 완료: {barcode} -> {self.barcode_output_file}")
-
         except Exception as e:
             self.logger.error(f"바코드 파일 저장 오류: {e}")
 
@@ -341,67 +591,42 @@ class NotepadAutoSave:
             return
 
         current_text = self.get_notepad_text(hwnd)
-        self.logger.info(f"[디버그] 현재 메모장 내용 (길이: {len(current_text)}): '{current_text[:100]}'")
 
-        # 메모장 내용이 비어있으면 스킵
         if not current_text.strip():
-            self.logger.info("[디버그] 메모장이 비어있습니다. 처리 건너뜀")
             return
 
-        # 메모장 내용이 변경되었는지 확인
         if current_text == self.last_content:
-            self.logger.info("[디버그] 내용이 이전과 동일합니다. 처리 건너뜀")
             return
 
-        self.logger.info("[디버그] 내용이 변경되었습니다! 바코드 추출 시작")
-
-        # 최신 바코드 추출
         latest_barcode = self.extract_latest_barcode(current_text)
-        self.logger.info(f"[디버그] 추출된 바코드: '{latest_barcode}'")
+        if not latest_barcode:
+            return
 
-        if latest_barcode:
-            self.logger.info(f"바코드 감지: '{latest_barcode}'")
+        lines = [l for l in current_text.strip().split('\n') if l.strip()]
+        line_count = len(lines)
 
-            # 줄 수 확인
-            lines = [l for l in current_text.strip().split('\n') if l.strip()]
-            line_count = len(lines)
-            self.logger.info(f"[디버그] 유효한 줄 수: {line_count}, 텍스트 stripped 길이: {len(current_text.strip())}, 바코드 길이: {len(latest_barcode.strip())}")
+        # 무한 루프 방지: 유효한 줄이 1줄이고 그게 최신 바코드면 스킵
+        if line_count <= 1 and current_text.strip() == latest_barcode.strip():
+            self.last_content = current_text
+            self.last_barcode = latest_barcode
+            return
 
-            # 무한 루프 방지: 유효한 줄이 1줄이고 그게 최신 바코드면 스킵
-            if line_count <= 1 and current_text.strip() == latest_barcode.strip():
-                self.logger.info(f"[디버그] 이미 마지막 줄만 남아있습니다. 스킵합니다.")
-                self.last_content = current_text
-                self.last_barcode = latest_barcode
-                return
+        self.logger.info(f"[모니터] 여러 줄 감지 ({line_count}줄). 마지막 줄만 남기기: '{latest_barcode}'")
 
-            self.logger.info(f"[디버그] 여러 줄 감지됨. 마지막 줄만 남기기 시작...")
-
-            # 메모장 내용을 최신 바코드만 남기고 삭제
-            if self.set_notepad_text(hwnd, latest_barcode):
-                self.logger.info(f"메모장 내용 업데이트 성공: '{latest_barcode}'만 남김")
-
-                # 강제 저장
-                time.sleep(0.1)
-                if self.send_save_command(hwnd):
-                    self.logger.info(f"메모장 저장 완료")
-
-                # 별도 파일에도 저장
-                self.save_barcode_to_file(latest_barcode)
-
-                self.last_barcode = latest_barcode
-                self.last_content = latest_barcode
-            else:
-                self.logger.error(f"텍스트 설정 실패! 무한 루프 방지를 위해 last_content 업데이트")
-                self.last_content = current_text
-                self.last_barcode = latest_barcode
+        if self.set_notepad_text(hwnd, latest_barcode):
+            time.sleep(0.1)
+            self.send_save_command(hwnd)
+            self.save_barcode_to_file(latest_barcode)
+            self.last_barcode = latest_barcode
+            self.last_content = latest_barcode
         else:
-            self.logger.warning(f"[디버그] 바코드를 추출할 수 없습니다.")
+            self.last_content = current_text
+            self.last_barcode = latest_barcode
 
 
 def main():
     """메인 함수"""
 
-    # 시작 확인창
     root = tk.Tk()
     root.withdraw()
 
@@ -410,14 +635,17 @@ def main():
         "메모장 자동 저장 프로그램을 시작하시겠습니까?\n\n"
         "기능:\n"
         "- 메모장 자동 저장\n"
-        "- 바코드 최신 것만 추출 (자동)\n\n"
-        "방식: UI Automation (클립보드 사용 안 함)"
+        "- 바코드 스캐너 입력 자동 감지\n"
+        "- 어떤 창에서든 바코드 → 메모장으로 전송\n\n"
+        "방식: UI Automation + 키보드 훅"
     )
     if not start:
         return
 
-    # 프로그램 실행
     autosaver = NotepadAutoSave()
+
+    # 바코드 인터셉터 시작
+    autosaver.start_interceptor()
 
     # 종료 버튼이 있는 작은 창
     ui = tk.Tk()
@@ -427,8 +655,8 @@ def main():
     label = tk.Label(
         ui,
         text="메모장 자동 저장이 실행 중입니다.\n"
-             "바코드 기능도 활성화되었습니다.\n"
-             "(UI Automation 방식)\n\n"
+             "바코드 스캐너 입력을 자동 감지합니다.\n"
+             "(어떤 창에서든 메모장으로 전송)\n\n"
              "끝내려면 아래 버튼을 누르세요.",
         justify=tk.LEFT
     )
@@ -443,7 +671,6 @@ def main():
 
     ui.protocol("WM_DELETE_WINDOW", on_exit)
 
-    # UI 이벤트 루프와 자동 저장 루프 통합
     def tick():
         if autosaver.stop_requested:
             return
@@ -455,18 +682,14 @@ def main():
             for hwnd in notepad_windows:
                 title = autosaver.get_window_title(hwnd)
 
-                # 자동 저장
                 if autosaver.has_unsaved_changes(hwnd):
                     autosaver.logger.info(f"변경사항 감지: '{title}'")
                     if autosaver.send_save_command(hwnd):
                         autosaver.logger.info(f"자동 저장 완료: '{title}'")
-                    else:
-                        autosaver.logger.warning(f"자동 저장 실패: '{title}'")
 
-                # 바코드 처리
+                # 메모장 직접 입력 감지 (인터셉터와 병행)
                 autosaver.process_notepad_content(hwnd)
 
-        # 다음 실행 예약
         ui.after(int(check_interval * 1000), tick)
 
     tick()
