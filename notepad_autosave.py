@@ -18,6 +18,7 @@ import logging
 from datetime import datetime
 import os
 import sys
+import subprocess
 import tkinter as tk
 from tkinter import messagebox
 
@@ -94,17 +95,35 @@ class NotepadAutoSave:
         self.logger = logging.getLogger(__name__)
 
     def find_notepad_windows(self):
-        """열려있는 모든 메모장 창 찾기"""
+        """열려있는 모든 메모장 창 찾기 (최소화 상태 포함)"""
         notepad_windows = []
 
         def enum_callback(hwnd, results):
-            if win32gui.IsWindowVisible(hwnd):
-                class_name = win32gui.GetClassName(hwnd)
-                if class_name == 'Notepad':
-                    results.append(hwnd)
+            class_name = win32gui.GetClassName(hwnd)
+            if class_name == 'Notepad':
+                results.append(hwnd)
             return True
 
         win32gui.EnumWindows(enum_callback, notepad_windows)
+        return notepad_windows
+
+    def ensure_notepad_running(self):
+        """메모장이 실행 중이 아니면 자동으로 실행"""
+        notepad_windows = self.find_notepad_windows()
+        if not notepad_windows:
+            self.logger.info("메모장이 실행 중이 아닙니다. 자동으로 실행합니다...")
+            try:
+                subprocess.Popen(['notepad.exe'])
+                # 메모장이 완전히 열릴 때까지 대기
+                for _ in range(20):
+                    time.sleep(0.3)
+                    notepad_windows = self.find_notepad_windows()
+                    if notepad_windows:
+                        self.logger.info("메모장 자동 실행 완료")
+                        return notepad_windows
+                self.logger.warning("메모장 자동 실행 후 창을 찾지 못함")
+            except Exception as e:
+                self.logger.error(f"메모장 자동 실행 실패: {e}")
         return notepad_windows
 
     def get_window_title(self, hwnd):
@@ -431,7 +450,7 @@ def main():
 
         check_interval = autosaver.config['check_interval']
 
-        notepad_windows = autosaver.find_notepad_windows()
+        notepad_windows = autosaver.ensure_notepad_running()
         if notepad_windows:
             for hwnd in notepad_windows:
                 title = autosaver.get_window_title(hwnd)
