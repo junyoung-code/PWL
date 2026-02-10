@@ -159,6 +159,13 @@ class NotepadAutoSave:
             self.logger.error(f"UIA 편집 컨트롤 검색 오류: {e}")
             return None
 
+    def normalize_line_endings(self, text):
+        """줄바꿈 문자를 \n으로 통일 (Windows 11 UIA는 \r만 사용할 수 있음)"""
+        # \r\n → \n 먼저 처리, 그 다음 남은 \r → \n
+        text = text.replace('\r\n', '\n')
+        text = text.replace('\r', '\n')
+        return text
+
     def get_notepad_text(self, hwnd):
         """UI Automation으로 메모장 텍스트 읽기"""
         try:
@@ -172,7 +179,9 @@ class NotepadAutoSave:
                 if tp:
                     text = tp.DocumentRange.GetText(-1)
                     if text:
-                        self.logger.info(f"[TextPattern] 텍스트 읽기 성공 (길이: {len(text)}, 줄수: {text.count(chr(10)) + text.count(chr(13)) + 1})")
+                        text = self.normalize_line_endings(text)
+                        lines = [l for l in text.split('\n') if l.strip()]
+                        self.logger.info(f"[TextPattern] 텍스트 읽기 성공 (길이: {len(text)}, 유효줄수: {len(lines)})")
                         return text
             except Exception as e:
                 self.logger.info(f"[TextPattern] 실패: {e}")
@@ -183,6 +192,7 @@ class NotepadAutoSave:
                 if vp:
                     text = vp.Value
                     if text:
+                        text = self.normalize_line_endings(text)
                         self.logger.info(f"[ValuePattern] 텍스트 읽기 성공 (길이: {len(text)})")
                         return text
             except Exception as e:
