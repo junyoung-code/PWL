@@ -166,27 +166,29 @@ class NotepadAutoSave:
             if not edit_control:
                 return ""
 
-            # 방법 1: ValuePattern 사용
-            try:
-                vp = edit_control.GetValuePattern()
-                if vp:
-                    text = vp.Value
-                    self.logger.debug(f"UIA ValuePattern 텍스트 읽기 성공: '{text[:50]}'")
-                    return text
-            except Exception as e:
-                self.logger.debug(f"ValuePattern 실패: {e}")
-
-            # 방법 2: TextPattern 사용
+            # 방법 1: TextPattern 사용 (멀티라인 텍스트에 가장 정확)
             try:
                 tp = edit_control.GetTextPattern()
                 if tp:
                     text = tp.DocumentRange.GetText(-1)
-                    self.logger.debug(f"UIA TextPattern 텍스트 읽기 성공: '{text[:50]}'")
-                    return text
+                    if text:
+                        self.logger.info(f"[TextPattern] 텍스트 읽기 성공 (길이: {len(text)}, 줄수: {text.count(chr(10)) + text.count(chr(13)) + 1})")
+                        return text
             except Exception as e:
-                self.logger.debug(f"TextPattern 실패: {e}")
+                self.logger.info(f"[TextPattern] 실패: {e}")
 
-            # 방법 3: GetWindowText 폴백 (Win32)
+            # 방법 2: ValuePattern 사용 (단일 라인 또는 간단한 텍스트)
+            try:
+                vp = edit_control.GetValuePattern()
+                if vp:
+                    text = vp.Value
+                    if text:
+                        self.logger.info(f"[ValuePattern] 텍스트 읽기 성공 (길이: {len(text)})")
+                        return text
+            except Exception as e:
+                self.logger.info(f"[ValuePattern] 실패: {e}")
+
+            # 방법 3: WM_GETTEXT 폴백 (Win32 - Windows 10)
             try:
                 edit_hwnd = win32gui.FindWindowEx(hwnd, 0, "Edit", None)
                 if edit_hwnd:
@@ -196,10 +198,10 @@ class NotepadAutoSave:
                         buffer = ctypes.create_unicode_buffer(length + 1)
                         win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXT, length + 1, buffer)
                         text = buffer.value
-                        self.logger.debug(f"Win32 WM_GETTEXT 폴백 성공: '{text[:50]}'")
+                        self.logger.info(f"[WM_GETTEXT] 폴백 성공 (길이: {len(text)})")
                         return text
             except Exception as e:
-                self.logger.debug(f"Win32 폴백 실패: {e}")
+                self.logger.info(f"[WM_GETTEXT] 폴백 실패: {e}")
 
             self.logger.warning("모든 텍스트 읽기 방식 실패")
             return ""
@@ -220,36 +222,46 @@ class NotepadAutoSave:
                 vp = edit_control.GetValuePattern()
                 if vp:
                     vp.SetValue(text)
-                    self.logger.info(f"UIA ValuePattern 텍스트 설정 성공: '{text[:50]}'")
+                    self.logger.info(f"[ValuePattern] 텍스트 설정 성공: '{text[:50]}'")
                     return True
             except Exception as e:
-                self.logger.debug(f"ValuePattern SetValue 실패: {e}")
+                self.logger.info(f"[ValuePattern] SetValue 실패: {e}")
 
-            # 방법 2: 전체 선택 후 텍스트 입력 (SendKeys)
+            # 방법 2: TextPattern으로 전체 선택 후 ValuePattern으로 설정
+            try:
+                tp = edit_control.GetTextPattern()
+                if tp:
+                    tp.DocumentRange.Select()
+                    time.sleep(0.05)
+                    vp = edit_control.GetValuePattern()
+                    if vp:
+                        vp.SetValue(text)
+                        self.logger.info(f"[TextPattern+ValuePattern] 텍스트 설정 성공: '{text[:50]}'")
+                        return True
+            except Exception as e:
+                self.logger.info(f"[TextPattern+ValuePattern] 실패: {e}")
+
+            # 방법 3: SendKeys로 전체 선택 후 텍스트 입력
             try:
                 edit_control.SetFocus()
                 time.sleep(0.05)
-
-                # Ctrl+A로 전체 선택
                 edit_control.SendKeys('{Ctrl}a')
                 time.sleep(0.05)
-
-                # 텍스트 입력 (선택된 텍스트를 대체)
                 edit_control.SendKeys(text, interval=0)
-                self.logger.info(f"UIA SendKeys 텍스트 설정 성공: '{text[:50]}'")
+                self.logger.info(f"[SendKeys] 텍스트 설정 성공: '{text[:50]}'")
                 return True
             except Exception as e:
-                self.logger.debug(f"SendKeys 실패: {e}")
+                self.logger.info(f"[SendKeys] 실패: {e}")
 
-            # 방법 3: Win32 WM_SETTEXT 폴백 (Windows 10)
+            # 방법 4: Win32 WM_SETTEXT 폴백 (Windows 10)
             try:
                 edit_hwnd = win32gui.FindWindowEx(hwnd, 0, "Edit", None)
                 if edit_hwnd:
                     win32gui.SendMessage(edit_hwnd, win32con.WM_SETTEXT, 0, text)
-                    self.logger.info(f"Win32 WM_SETTEXT 폴백 성공: '{text[:50]}'")
+                    self.logger.info(f"[WM_SETTEXT] 폴백 성공: '{text[:50]}'")
                     return True
             except Exception as e:
-                self.logger.debug(f"Win32 WM_SETTEXT 폴백 실패: {e}")
+                self.logger.info(f"[WM_SETTEXT] 폴백 실패: {e}")
 
             self.logger.error("모든 텍스트 설정 방식 실패")
             return False
@@ -321,8 +333,13 @@ class NotepadAutoSave:
         if latest_barcode:
             self.logger.info(f"바코드 감지: '{latest_barcode}'")
 
-            # 무한 루프 방지: 이미 한 줄만 있고 그게 최신 바코드면 스킵
-            if current_text.strip() == latest_barcode.strip():
+            # 줄 수 확인
+            lines = [l for l in current_text.strip().split('\n') if l.strip()]
+            line_count = len(lines)
+            self.logger.info(f"[디버그] 유효한 줄 수: {line_count}, 텍스트 stripped 길이: {len(current_text.strip())}, 바코드 길이: {len(latest_barcode.strip())}")
+
+            # 무한 루프 방지: 유효한 줄이 1줄이고 그게 최신 바코드면 스킵
+            if line_count <= 1 and current_text.strip() == latest_barcode.strip():
                 self.logger.info(f"[디버그] 이미 마지막 줄만 남아있습니다. 스킵합니다.")
                 self.last_content = current_text
                 self.last_barcode = latest_barcode
