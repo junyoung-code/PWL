@@ -1,5 +1,6 @@
 {
   "enable_logging": true,
   "log_file": "autosave.log",
-  "barcode_timeout_ms": 500
+  "scanner_key_interval_ms": 50,
+  "barcode_flush_timeout_ms": 100
 }

@@ -90,9 +90,6 @@ echo.
     --name "NotepadAutoSave" ^
     --icon=NONE ^
     --add-data "config.json;." ^
-    --hidden-import=uiautomation ^
-    --hidden-import=comtypes ^
-    --hidden-import=comtypes.stream ^
     notepad_autosave.py
 
 if errorlevel 1 (

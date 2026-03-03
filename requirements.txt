@@ -1,4 +1,2 @@
 pywin32>=305
 pyinstaller>=5.13.0
-uiautomation>=2.0.18
-comtypes>=1.2.1
